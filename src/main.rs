@@ -152,7 +152,7 @@ fn main() -> Result<()> {
 
     let printer: Box<dyn Printer> = match cli.format {
         OutputFormat::Text => Box::new(TextPrinter),
-        OutputFormat::Json => Box::new(JsonPrinter),
+        OutputFormat::Json => Box::new(JsonPrinter::new()),
         OutputFormat::Csv => Box::new(CsvPrinter),
     };
 

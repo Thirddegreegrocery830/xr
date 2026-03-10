@@ -51,6 +51,9 @@ pub enum Confidence {
     LocalProp = 3,
     /// Full CFG + dataflow for the containing function.
     /// Most accurate short of interprocedural analysis.
+    ///
+    /// **Not yet implemented** — reserved for a future analysis pass.
+    /// `ConfidenceCounts::function_flow` will always be zero until then.
     FunctionFlow = 4,
 }
 
@@ -67,8 +70,14 @@ impl Confidence {
 }
 
 impl XrefKind {
-    /// Short ASCII label used in text output and JSON serialisation.
-    /// Indirect variants collapse to their direct counterpart category.
+    /// Short ASCII label used in text output, JSON serialisation, and benchmark scoring.
+    ///
+    /// `CondJump`, `IndirectCall`, and `IndirectJump` collapse to their direct
+    /// counterparts (`"jump"` / `"call"`) to match IDA Pro's output, which does not
+    /// distinguish conditionality or indirection in the xref kind label.  These three
+    /// variants are retained in the enum for internal use (e.g. `is_code_ref`) but are
+    /// effectively invisible in scored output — all scoring comparisons operate on
+    /// `name()` strings.
     pub fn name(self) -> &'static str {
         match self {
             Self::Call | Self::IndirectCall => "call",

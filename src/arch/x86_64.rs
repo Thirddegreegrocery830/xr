@@ -72,53 +72,10 @@ fn scan_linear_with_index(
 
         let va = insn.ip();
 
-        // Direct calls and jumps — only from executable regions
+        // Direct calls / jumps and GOT-indirect calls — only from executable regions.
+        // Decoding data/padding bytes as instructions produces spurious FPs.
         if region_is_exec {
-            match insn.flow_control() {
-                iced_x86::FlowControl::Call => {
-                    if let Some(target) = direct_target(&insn) {
-                        if idx.contains(target) {
-                            xrefs.push(Xref {
-                                from: va,
-                                to: target,
-                                kind: XrefKind::Call,
-                                confidence: Confidence::LinearImmediate,
-                            });
-                        }
-                    }
-                }
-                iced_x86::FlowControl::UnconditionalBranch => {
-                    if let Some(target) = direct_target(&insn) {
-                        if idx.contains(target) {
-                            xrefs.push(Xref {
-                                from: va,
-                                to: target,
-                                kind: XrefKind::Jump,
-                                confidence: Confidence::LinearImmediate,
-                            });
-                        }
-                    }
-                }
-                iced_x86::FlowControl::ConditionalBranch => {
-                    if let Some(target) = direct_target(&insn) {
-                        if idx.contains(target) {
-                            xrefs.push(Xref {
-                                from: va,
-                                to: target,
-                                kind: XrefKind::CondJump,
-                                confidence: Confidence::LinearImmediate,
-                            });
-                        }
-                    }
-                }
-                // Indirect call/jump through memory (FF 15 / FF 25): resolve via got_map.
-                // If the memory operand is [RIP+disp32] and the target GOT slot is in
-                // got_map, emit a Call or Jump xref to the extern VA.
-                FlowControl::IndirectCall | FlowControl::IndirectBranch => {
-                    emit_got_indirect(&insn, va, got_map, &mut xrefs);
-                }
-                _ => {}
-            }
+            emit_direct_branches(&insn, va, idx, got_map, &mut xrefs);
         }
 
         emit_rip_relative(&insn, va, idx, &mut info_factory, &mut xrefs);
@@ -185,40 +142,9 @@ pub(crate) fn scan_with_prop(
 
         let va = insn.ip();
 
-        // Collect depth-1 branch/call xrefs — only from exec regions
+        // Depth-1 branch/call xrefs — only from executable regions.
         if region_is_exec {
-            if let Some(target) = direct_target(&insn) {
-                if idx.contains(target) {
-                    let kind = match insn.flow_control() {
-                        iced_x86::FlowControl::Call => XrefKind::Call,
-                        iced_x86::FlowControl::UnconditionalBranch => XrefKind::Jump,
-                        iced_x86::FlowControl::ConditionalBranch => XrefKind::CondJump,
-                        // XBEGIN encodes a NearBranch relative offset (the TSX abort handler)
-                        // but has FlowControl::XbeginXabortXend. Treat it as a conditional
-                        // jump — execution either enters the transaction or jumps to the handler.
-                        iced_x86::FlowControl::XbeginXabortXend => XrefKind::CondJump,
-                        // direct_target() only returns Some for near-branch operands,
-                        // which only exist on call/jmp/jcc/xbegin — all covered above.
-                        other => unreachable!(
-                            "direct_target returned Some for non-branch flow {:?}",
-                            other
-                        ),
-                    };
-                    xrefs.push(Xref {
-                        from: va,
-                        to: target,
-                        kind,
-                        confidence: Confidence::LinearImmediate,
-                    });
-                }
-            }
-            // Indirect call/jump through GOT (FF 15 / FF 25): resolve via got_map.
-            if matches!(
-                insn.flow_control(),
-                FlowControl::IndirectCall | FlowControl::IndirectBranch
-            ) {
-                emit_got_indirect(&insn, va, got_map, &mut xrefs);
-            }
+            emit_direct_branches(&insn, va, idx, got_map, &mut xrefs);
         }
 
         emit_rip_relative(&insn, va, idx, &mut info_factory, &mut xrefs);
@@ -272,6 +198,69 @@ pub(crate) fn scan_with_prop(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Emit xrefs for all direct branch/call instructions and GOT-indirect calls.
+///
+/// This is the single source-of-truth for branch emission, shared by
+/// `scan_linear_with_index` and `scan_with_prop`.  Both depth levels apply
+/// identical branch-detection logic; the only difference between them is that
+/// `scan_with_prop` additionally tracks register constants and resolves
+/// indirect `CALL reg` / `JMP reg` targets.
+///
+/// Handles:
+///   CALL rel32           → `Call`  (FlowControl::Call)
+///   JMP rel32            → `Jump`  (FlowControl::UnconditionalBranch)
+///   Jcc rel32/rel8       → `CondJump` (FlowControl::ConditionalBranch)
+///   XBEGIN rel32         → `CondJump` (FlowControl::XbeginXabortXend)
+///   CALL [RIP+disp32] }  → resolved via got_map → `Call`/`Jump` to extern VA
+///   JMP  [RIP+disp32] }  (FlowControl::IndirectCall / IndirectBranch, FF 15 / FF 25)
+#[inline]
+fn emit_direct_branches(
+    insn: &Instruction,
+    va: u64,
+    idx: &SegmentIndex,
+    got_map: &HashMap<u64, u64>,
+    xrefs: &mut Vec<Xref>,
+) {
+    match insn.flow_control() {
+        iced_x86::FlowControl::Call
+        | iced_x86::FlowControl::UnconditionalBranch
+        | iced_x86::FlowControl::ConditionalBranch
+        // XBEGIN encodes a NearBranch relative offset (the TSX abort handler)
+        // but has FlowControl::XbeginXabortXend. Treat it as a conditional
+        // jump — execution either enters the transaction or jumps to the handler.
+        | iced_x86::FlowControl::XbeginXabortXend => {
+            if let Some(target) = direct_target(insn) {
+                if idx.contains(target) {
+                    let kind = match insn.flow_control() {
+                        iced_x86::FlowControl::Call => XrefKind::Call,
+                        iced_x86::FlowControl::UnconditionalBranch => XrefKind::Jump,
+                        iced_x86::FlowControl::ConditionalBranch
+                        | iced_x86::FlowControl::XbeginXabortXend => XrefKind::CondJump,
+                        // All cases are listed in the outer match arm — unreachable.
+                        other => unreachable!(
+                            "direct_target returned Some for non-branch flow {:?}",
+                            other
+                        ),
+                    };
+                    xrefs.push(Xref {
+                        from: va,
+                        to: target,
+                        kind,
+                        confidence: Confidence::LinearImmediate,
+                    });
+                }
+            }
+        }
+        // Indirect call/jump through GOT (FF 15 / FF 25): resolve via got_map.
+        // If the memory operand is [RIP+disp32] and the GOT slot is in got_map,
+        // emit a Call or Jump xref to the extern VA.
+        FlowControl::IndirectCall | FlowControl::IndirectBranch => {
+            emit_got_indirect(insn, va, got_map, xrefs);
+        }
+        _ => {}
+    }
+}
 
 /// Emit a Call or Jump xref for an indirect `CALL [RIP+disp32]` / `JMP [RIP+disp32]`
 /// instruction (FF 15 / FF 25) when the resolved GOT slot is in `got_map`.

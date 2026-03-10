@@ -770,6 +770,27 @@ fn parse_macho(
         }
     };
 
+    // Mach-O sections that should NOT be byte-scanned for pointers.
+    //
+    // `__DATA_CONST,__got` / `__DATA,__got` — GOT entries are relocatable slot VAs,
+    //   not real pointers; without dyld fixup-chain context they produce many FPs.
+    // `__DATA_CONST,__auth_got` — same as __got but pointer-authenticated (AArch64).
+    // `__DATA,__la_symbol_ptr` / `__DATA,__nl_symbol_ptr` — lazy/non-lazy pointer
+    //   tables; same FP issue as GOT.
+    // `__DATA_CONST,__cfstring` / `__DATA,__cfstring` — CFString structures embed
+    //   compile-time layout offsets that coincidentally look like mapped VAs.
+    //
+    // These mirror ELF's NO_SCAN_SECTIONS (`.data.rel.ro`, `.data.rel.ro.local`).
+    const NO_SCAN_SECTIONS: &[&str] = &[
+        "__DATA_CONST,__got",
+        "__DATA,__got",
+        "__DATA_CONST,__auth_got",
+        "__DATA,__la_symbol_ptr",
+        "__DATA,__nl_symbol_ptr",
+        "__DATA_CONST,__cfstring",
+        "__DATA,__cfstring",
+    ];
+
     let mut segments = Vec::new();
     for seg in macho.segments.iter() {
         let seg_name = seg.name().unwrap_or("?").to_string();
@@ -784,6 +805,8 @@ fn parse_macho(
             let exec = seg.initprot & goblin::mach::constants::VM_PROT_EXECUTE != 0;
             let read = seg.initprot & goblin::mach::constants::VM_PROT_READ != 0;
             let write = seg.initprot & goblin::mach::constants::VM_PROT_WRITE != 0;
+            let full_name = format!("{seg_name},{sect_name}");
+            let byte_scannable = !exec && !NO_SCAN_SECTIONS.iter().any(|&n| n == full_name);
 
             let section_data: &'static [u8] = if data.is_empty() {
                 // S_ZEROFILL / S_GB_ZEROFILL / S_THREAD_LOCAL_ZEROFILL:
@@ -807,8 +830,8 @@ fn parse_macho(
                 readable: read,
                 writable: write,
                 mode: DecodeMode::Default,
-                name: format!("{seg_name},{sect_name}"),
-                byte_scannable: true,
+                name: full_name,
+                byte_scannable,
             });
         }
     }

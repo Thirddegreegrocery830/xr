@@ -39,10 +39,57 @@ def run_scanner(binary: Path, depth: int = 2) -> list[dict]:
                 pass
     return xrefs
 
-def load_ground_truth(binary: Path) -> list[dict]:
+def load_ground_truth(binary: Path, scanner_pie_base: int = 0x400000) -> list[dict]:
+    """Load IDA ground-truth xrefs, rebasing PIE ELF VAs when necessary.
+
+    IDA exports xrefs relative to its own image base.  When the ground-truth JSON
+    was generated from a PIE ELF binary (ET_DYN) loaded by IDA at a non-zero base,
+    the stored VAs already include IDA's base.  The xr scanner rebases the same
+    binary to ``scanner_pie_base`` (default 0x400000, matching IDA's Linux default).
+
+    Two JSON shapes are supported:
+      - ``[{...}, ...]``                        — flat list (legacy / non-PIE)
+      - ``{"image_base": <int>, "xrefs": [...]}`` — new format with explicit base
+
+    When the explicit ``image_base`` field is present and non-zero the stored VAs are
+    already rebased by IDA's base; we rebase them to ``scanner_pie_base`` so that
+    from/to addresses align with what xr emits.
+
+    For flat-list files the function assumes VAs are already in the scanner's
+    address space (i.e. the ground-truth JSON was pre-rebased, as described in
+    STATUS.md under "Ground truth cleanup").
+    """
     gt_path = Path(str(binary) + ".xrefs.json")
     with open(gt_path) as f:
-        return json.load(f)
+        raw = json.load(f)
+
+    if isinstance(raw, dict):
+        ida_base = int(raw.get("image_base", 0))
+        xrefs = raw.get("xrefs", [])
+    else:
+        # Flat list — assume VAs are already in scanner address space.
+        ida_base = 0
+        xrefs = raw
+
+    if ida_base != 0 and ida_base != scanner_pie_base:
+        # Shift all from/to VAs from IDA's base to the scanner's PIE base.
+        delta = scanner_pie_base - ida_base
+        rebased = []
+        addr_keys = (
+            ("from", "from_va", "src"),
+            ("to", "to_va", "dst", "target"),
+        )
+        for xref in xrefs:
+            entry = dict(xref)
+            for keys in addr_keys:
+                for k in keys:
+                    if k in entry and entry[k] is not None:
+                        entry[k] = entry[k] + delta
+                        break
+            rebased.append(entry)
+        return rebased
+
+    return xrefs
 
 def normalize_kind(kind: str) -> str:
     k = kind.lower()
@@ -70,13 +117,21 @@ def main():
     p.add_argument("binary")
     p.add_argument("--depth", type=int, default=2)
     p.add_argument("--kind", default="all", help="Filter: call, jump, data_ptr, all")
+    p.add_argument(
+        "--pie-base",
+        type=lambda x: int(x, 0),
+        default=0x400000,
+        help="PIE ELF load base used by xr (default: 0x400000). "
+             "Must match --base passed to xr. Used to rebase ground-truth VAs "
+             "when the JSON contains an explicit image_base field.",
+    )
     args = p.parse_args()
 
     binary = Path(args.binary)
     print(f"Running scanner on {binary.name} (depth={args.depth})...", flush=True)
 
     predicted = run_scanner(binary, args.depth)
-    ground_truth = load_ground_truth(binary)
+    ground_truth = load_ground_truth(binary, scanner_pie_base=args.pie_base)
 
     # Build sets of (from, to, kind) tuples
     def to_key(x, is_gt=False):
