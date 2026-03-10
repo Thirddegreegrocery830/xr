@@ -1,0 +1,49 @@
+[package]
+name = "xr"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "xr"
+path = "src/main.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+
+[lib]
+name = "xr"
+path = "src/lib.rs"
+
+[dependencies]
+# ARM64 decoding
+bad64 = "0.12"
+# x86-64 decoding (instr_info needed for OpAccess to detect read vs write)
+iced-x86 = { version = "1", features = ["instr_info"] }
+# Parallelism
+rayon = "1"
+# Memory mapping
+memmap2 = "0.9"
+# Binary parsing (Mach-O, ELF)
+goblin = { version = "0.9", default-features = true }
+# dyld shared cache parsing
+dylex = "0.4"
+# CLI
+clap = { version = "4", features = ["derive"] }
+# Error handling
+anyhow = "1"
+# Fast hash for shard dispatch
+rustc-hash = "2"
+# Fast non-crypto hash for dedup sets
+ahash = "0.8"
+# JSON for ground-truth loading
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

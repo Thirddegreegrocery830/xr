@@ -1,0 +1,8 @@
+/target
+
+# Test binaries and ground-truth data (managed separately)
+testcases/
+
+# Misc
+.DS_Store
+call

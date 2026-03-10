@@ -1,0 +1,266 @@
+pub mod arm64;
+pub mod arm64_decode;
+pub(crate) mod x86_64;
+
+use crate::loader::{DecodeMode, Segment};
+use crate::xref::{Confidence, Xref, XrefKind};
+
+/// Everything a single-pass xref extractor needs to know about
+/// the region it's scanning.
+pub(crate) struct ScanRegion<'a> {
+    pub data: &'a [u8],
+    pub base_va: u64,
+    /// Decode mode for this region (Default, Thumb, Arm32).
+    /// Reserved for arm32/Thumb scanners — not used by arm64/x86-64.
+    #[allow(dead_code)]
+    pub mode: DecodeMode,
+    /// True if the source segment is writable (e.g. .data, .got).
+    /// Reserved for future use by architecture-specific scanners.
+    #[allow(dead_code)]
+    pub writable: bool,
+}
+
+impl<'a> ScanRegion<'a> {
+    pub fn new(seg: &'a Segment, start_va: u64, end_va: u64) -> Self {
+        let offset = (start_va - seg.va) as usize;
+        let len = ((end_va - start_va) as usize).min(seg.data.len() - offset);
+        Self {
+            data: &seg.data[offset..offset + len],
+            base_va: start_va,
+            mode: seg.mode,
+            writable: seg.writable,
+        }
+    }
+}
+
+/// A set of candidate xrefs produced by a single scan pass.
+/// May contain duplicates (from shard overlap) — caller deduplicates.
+pub(crate) type XrefSet = Vec<Xref>;
+
+// ── Segment index ─────────────────────────────────────────────────────────────
+
+/// Sorted, copy-friendly VA interval table for O(log n) membership and
+/// attribute queries. Built once per pass from `LoadedBinary::segments`.
+///
+/// Each entry is `(start, end, flags)` where `flags` stores the segment
+/// attributes as a bitmask:
+///   bit 0 — executable
+///   bit 1 — writable
+pub(crate) struct SegmentIndex {
+    /// Sorted by `start`.
+    entries: Vec<(u64, u64, u8)>,
+}
+
+pub(crate) const FLAG_EXEC: u8 = 0b01;
+pub(crate) const FLAG_WRITE: u8 = 0b10;
+
+impl SegmentIndex {
+    pub(crate) fn build(segments: &[Segment]) -> Self {
+        let mut entries: Vec<(u64, u64, u8)> = segments
+            .iter()
+            .map(|s| {
+                let mut flags = 0u8;
+                if s.executable {
+                    flags |= FLAG_EXEC;
+                }
+                if s.writable {
+                    flags |= FLAG_WRITE;
+                }
+                (s.va, s.va + s.data.len() as u64, flags)
+            })
+            .collect();
+        entries.sort_unstable_by_key(|e| e.0);
+        Self { entries }
+    }
+
+    /// True if `va` falls within any mapped segment.
+    #[inline]
+    pub(crate) fn contains(&self, va: u64) -> bool {
+        self.entry_at(va).is_some()
+    }
+
+    /// True if `va` falls within an executable segment.
+    #[inline]
+    pub(crate) fn is_exec(&self, va: u64) -> bool {
+        self.entry_at(va).is_some_and(|f| f & FLAG_EXEC != 0)
+    }
+
+    /// Returns the flags byte for the segment covering `va`, or None if unmapped.
+    #[inline]
+    pub(crate) fn flags_at(&self, va: u64) -> Option<u8> {
+        self.entry_at(va)
+    }
+
+    /// Binary-search for the entry covering `va`. Returns the flags byte.
+    #[inline]
+    fn entry_at(&self, va: u64) -> Option<u8> {
+        // Find the last entry whose start <= va.
+        let idx = self.entries.partition_point(|e| e.0 <= va);
+        if idx == 0 {
+            return None;
+        }
+        let (start, end, flags) = self.entries[idx - 1];
+        if va < end && va >= start {
+            Some(flags)
+        } else {
+            None
+        }
+    }
+}
+
+// ── SegmentDataIndex ──────────────────────────────────────────────────────────
+
+/// Sorted VA interval table that also carries the raw data slice for each
+/// segment. Used for O(log n) `read_u64_at` in the hot byte-scan and
+/// ADRP/LDR pointer-follow paths — replacing the previous O(n_segments)
+/// `segments.iter().find()` linear scan.
+///
+/// Each entry is `(start, end, flags, data_ptr, data_len)` where:
+///   - `(start, end)` is the VA range `[start, end)`
+///   - `flags` is the same bitmask as `SegmentIndex` (bit 0 = exec, bit 1 = write)
+///   - `data_ptr` / `data_len` point into the segment's zero-copy backing store
+///
+/// The data pointer is stored as a raw `*const u8` so the struct can be
+/// `Send + Sync`. Safety invariant: the backing allocation (mmap or `_bss_bufs`)
+/// lives at least as long as this index, which is guaranteed because
+/// `SegmentDataIndex` is built from `&LoadedBinary` and only lives within the
+/// same `XrefPass::run()` call that borrows it.
+pub(crate) struct SegmentDataIndex {
+    /// Sorted by `start`.
+    entries: Vec<(u64, u64, u8, *const u8, usize)>,
+}
+
+// Safety: the raw pointers inside point into mmaps / Box<[u8]> that are
+// `Send + Sync` themselves; we never mutate through them.
+unsafe impl Send for SegmentDataIndex {}
+unsafe impl Sync for SegmentDataIndex {}
+
+impl SegmentDataIndex {
+    pub(crate) fn build(segments: &[crate::loader::Segment]) -> Self {
+        let mut entries: Vec<(u64, u64, u8, *const u8, usize)> = segments
+            .iter()
+            .map(|s| {
+                let mut flags = 0u8;
+                if s.executable {
+                    flags |= FLAG_EXEC;
+                }
+                if s.writable {
+                    flags |= FLAG_WRITE;
+                }
+                (
+                    s.va,
+                    s.va + s.data.len() as u64,
+                    flags,
+                    s.data.as_ptr(),
+                    s.data.len(),
+                )
+            })
+            .collect();
+        entries.sort_unstable_by_key(|e| e.0);
+        Self { entries }
+    }
+
+    /// Binary-search for the entry covering `va`.
+    /// Returns `(flags, data_ptr, data_len, start_va)` or `None` if unmapped.
+    #[inline]
+    fn entry_at(&self, va: u64) -> Option<(u8, *const u8, usize, u64)> {
+        let idx = self.entries.partition_point(|e| e.0 <= va);
+        if idx == 0 {
+            return None;
+        }
+        let (start, end, flags, ptr, len) = self.entries[idx - 1];
+        if va >= start && va < end {
+            Some((flags, ptr, len, start))
+        } else {
+            None
+        }
+    }
+
+    /// Read a little-endian `u64` at `va` in a **non-executable** segment.
+    /// Returns `None` if `va` is unmapped, executable, or the read would
+    /// overflow the segment.
+    #[inline]
+    pub(crate) fn read_u64_at_nonexec(&self, va: u64) -> Option<u64> {
+        let (flags, ptr, len, start) = self.entry_at(va)?;
+        if flags & FLAG_EXEC != 0 {
+            return None;
+        }
+        let offset = (va - start) as usize;
+        if offset + 8 > len {
+            return None;
+        }
+        // Safety: ptr..ptr+len is valid for the lifetime of the backing store
+        // (mmap or _bss_bufs), which outlives this index (built within run()).
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), 8) };
+        Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    /// Returns the flags byte for the segment covering `va`, or `None` if unmapped.
+    #[inline]
+    pub(crate) fn flags_at(&self, va: u64) -> Option<u8> {
+        self.entry_at(va).map(|(f, _, _, _)| f)
+    }
+}
+
+/// Pointer-width byte scan over a data region.
+///
+/// Emits `DataPointer` xrefs for every aligned pointer-sized slot whose value
+/// lands in a mapped segment, subject to:
+///
+/// - **Non-exec target**: always emitted — data→data pointers are unambiguous.
+/// - **Exec target**: emitted only when `target >= 0x0100_0000`. Values below
+///   that threshold are almost always 3-byte ASCII strings whose little-endian
+///   representation accidentally falls in the code segment VA range (e.g.
+///   `"ode\0…"` → `0x65646f`). No real 64-bit code pointer is below 16 MiB.
+pub(crate) fn byte_scan_pointers(
+    region: &ScanRegion,
+    data_idx: &SegmentDataIndex,
+    pointer_size: usize,
+) -> XrefSet {
+    let mut xrefs = Vec::new();
+    let data = region.data;
+    let step = pointer_size;
+
+    // Only scan on pointer-aligned boundaries.
+    // Guard: if data is shorter than one pointer we have nothing to scan.
+    if data.len() < pointer_size {
+        return xrefs;
+    }
+    let end = data.len() - pointer_size; // safe: checked above
+
+    let mut i = 0usize;
+    while i <= end {
+        let target = if pointer_size == 8 {
+            u64::from_le_bytes(data[i..i + 8].try_into().unwrap())
+        } else {
+            u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as u64
+        };
+
+        if target != 0 {
+            let emit = match data_idx.flags_at(target) {
+                // Target in a non-exec segment: always emit.
+                Some(f) if f & FLAG_EXEC == 0 => true,
+                // Target in an exec segment: vtables and function pointer tables
+                // legitimately hold code pointers, so allow them — but require at
+                // least 4 significant bytes to reject ASCII-string false positives.
+                // Strings in data sections can form a value in the exec VA range
+                // from just 3 bytes (e.g. "ode\0…" → 0x65646f in a binary loaded
+                // at 0x400000). No real 64-bit code pointer is below 0x0100_0000.
+                Some(_) => target >= 0x0100_0000,
+                // Target not in any mapped segment: skip.
+                None => false,
+            };
+            if emit {
+                let from = region.base_va + i as u64;
+                xrefs.push(Xref {
+                    from,
+                    to: target,
+                    kind: XrefKind::DataPointer,
+                    confidence: Confidence::ByteScan,
+                });
+            }
+        }
+        i += step;
+    }
+    xrefs
+}
