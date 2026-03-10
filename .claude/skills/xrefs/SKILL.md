@@ -1,0 +1,174 @@
+---
+name: xrefs
+description: Find cross-references (callers, callees, data references) in native binaries using the `xr` tool. Use when reverse engineering ELF, Mach-O, PE, or dyld-cache binaries and you need to find what calls a function, what references a symbol, who reads/writes a data address, or what code a given function calls — without reaching for objdump/grep pipelines.
+---
+
+# xr — Binary Cross-Reference Tool
+
+`xr` is a fast, multi-threaded cross-reference scanner for native binaries. It extracts caller→callee edges and data references directly from machine code — no debug info or symbols required.
+
+**Reach for `xr` instead of `objdump | grep` when you need to:**
+- Find all callers of a function at a known address
+- Find all references to a data symbol or GOT entry
+- Map the call graph around a specific address
+- See what a function calls (its callees)
+- Locate pointer references to a region in data sections
+
+## Supported formats & architectures
+
+| Format | Architectures (fully scanned) |
+|--------|-------------------------------|
+| ELF | x86-64, AArch64 |
+| Mach-O (single-arch) | x86-64, ARM64 |
+| PE / COFF | x86-64, ARM64 |
+| Apple dyld shared cache | arm64, arm64e, x86_64, x86_64h |
+| Raw flat binary | treated as single executable segment at VA 0 |
+
+x86-32 and ARM32 are parsed and loaded but not yet scanned.
+**Fat/universal Mach-O**: run `lipo -extract <arch> input output` first.
+
+## Quick reference
+
+```
+xr [OPTIONS] <BINARY>
+
+  -f text|json|csv        Output format (default: text)
+  -k call|jump|data_read|data_write|data_ptr
+                          Filter to one xref kind
+  -d scan|linear|paired   Analysis depth (default: paired)
+  -B N / -A N             Show N disasm lines before/after each xref site
+  --ref-start VA          Keep only xrefs whose target >= VA
+  --ref-end   VA          Keep only xrefs whose target <  VA
+  --start VA / --end VA   Restrict scan to source addresses in [VA, VA)
+  --base VA               Override PIE ELF load base (default 0x400000)
+  --limit N               Cap output at N results
+  -j N                    Worker threads (0 = all CPUs)
+```
+
+VAs accept `0x`-prefixed hex or plain decimal.
+
+## Xref kinds
+
+| Kind | What it means |
+|------|---------------|
+| `call` | Direct or indirect call (CALL / BL / BLR) |
+| `jump` | Unconditional or conditional branch (JMP / B / Jcc / CBZ…) |
+| `data_read` | Load from a data address (LDR / MOV from [rip+disp]) |
+| `data_write` | Store to a data address (STR / MOV to [rip+disp]) |
+| `data_ptr` | Pointer in a data section pointing into code/data; ADRP+ADD pairs; LEA [rip+disp] |
+
+## Common RE workflows
+
+### 1. Find all callers of a function
+
+```bash
+# Who calls the function at 0x401234?
+xr binary --ref-start 0x401234 --ref-end 0x401235 -k call
+
+# Unique caller list
+xr binary --ref-start 0x401234 --ref-end 0x401235 -k call -f csv \
+  | awk -F, '{print $1}' | sort -u
+```
+
+### 2. Find all callees of a function
+
+```bash
+# What does the function at 0x401000–0x4012ff call?
+xr binary --start 0x401000 --end 0x401300 -k call
+```
+
+### 3. Find all references to a data address
+
+```bash
+# What reads or writes the global at 0x408000?
+xr binary --ref-start 0x408000 --ref-end 0x408008 -k data_read
+xr binary --ref-start 0x408000 --ref-end 0x408008 -k data_write
+
+# All reference kinds at once
+xr binary --ref-start 0x408000 --ref-end 0x408008
+```
+
+### 4. Inspect call sites with disassembly context
+
+```bash
+# Like grep -B3 -A3 but for machine code
+xr binary --ref-start 0x401234 --ref-end 0x401235 -k call -B 3 -A 3
+
+# JSON with embedded context for scripting
+xr binary --ref-start 0x401234 --ref-end 0x401235 -k call -B 2 -A 2 -f json
+```
+
+### 5. Scan only one function's range (avoid full-binary cost)
+
+```bash
+xr binary --start 0x401000 --end 0x402000
+```
+
+### 6. Pointer hunting in data sections
+
+```bash
+# Find all data pointers into the .text range 0x401000–0x410000
+xr binary --ref-start 0x401000 --ref-end 0x410000 -k data_ptr
+```
+
+### 7. PIE binary with custom base
+
+```bash
+# Rebase a PIE ELF to the address ASLR placed it at runtime
+xr binary --base 0x7f4000000000 \
+  --ref-start 0x7f4000401234 --ref-end 0x7f4000401235
+```
+
+### 8. dyld shared cache
+
+```bash
+# Works directly on the cache — no extraction needed
+xr /System/Library/dyld/dyld_shared_cache_arm64e \
+  --ref-start 0x1a3b00000 --ref-end 0x1a3b00010 -k call -B 2
+```
+
+### 9. Quick call graph (JSON + jq)
+
+```bash
+xr binary -k call -f json \
+  | jq -r '.[] | "\(.from) -> \(.to)"' \
+  | sort -u | head -50
+```
+
+## Output formats
+
+**text** (default):
+```
+0x0000000000401234 -> 0x0000000000403000  call  [linear-immediate]
+```
+With `-B`/`-A`, indented disasm lines follow each xref entry.
+
+**json**: array of objects with `from`, `to`, `kind`, `confidence` fields.
+With `-B`/`-A`, each object gains a `"context"` array of `{va, hex, text, focus}`.
+
+**csv**: `from,to,kind,confidence` per line — no context even with `-B`/`-A`.
+
+## Analysis depth (`-d`)
+
+| Value | Finds | Speed |
+|-------|-------|-------|
+| `scan` | Pointer-sized values in data sections | Fastest, most false positives |
+| `linear` | Direct branches + RIP-relative / ADRP memory refs | Fast, ~85% recall |
+| `paired` (default) | All of linear + ADRP pairs (ARM64) + register const-prop (x86-64) | Best quality |
+
+## Confidence levels (in output)
+
+| Value | Source |
+|-------|--------|
+| `linear-immediate` | Direct branch/call with immediate target |
+| `pair-resolved` | ADRP+ADD/LDR pair (ARM64) or RIP-relative LEA/MOV (x86-64) |
+| `local-prop` | Register constant propagation (`MOV rax, imm64; CALL rax`) |
+| `byte-scan` | Pointer-sized value in a data section — highest false positive rate |
+
+## Tips
+
+- **Start narrow**: pin a target with `--ref-start`/`--ref-end` rather than scanning everything and post-filtering.
+- **Disasm context** (`-B`/`-A`) is anchor-decoded from the exact xref VA — no alignment drift. It replaces `objdump -d | sed -n '/addr/,+N p'` workflows.
+- **Fat Mach-O**: if `xr` rejects the binary, run `lipo -extract arm64 binary thin` first.
+- **ARM64 indirect calls** (BLR xN) resolved via ADRP+ADD pairing are emitted as `call` with `pair-resolved` confidence.
+- **False positives**: `byte-scan` confidence entries are speculative. Filter them out with `-k call` or `-k data_read` when you want only decoded references.
