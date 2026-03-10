@@ -113,6 +113,19 @@ impl LoadedBinary {
     /// Supports ELF, single-arch Mach-O, and PE. Fat (universal) Mach-O binaries
     /// are not supported — extract the desired arch slice first (e.g. with `lipo`).
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_with_base(path, None)
+    }
+
+    /// Like `load`, but allows overriding the base VA for PIE ELF binaries.
+    ///
+    /// `base` is the virtual address at which the binary's first PT_LOAD segment
+    /// (the one with `p_vaddr == 0`) is assumed to be mapped.  For non-PIE ELF,
+    /// Mach-O, and PE binaries the preferred base is already baked into the binary
+    /// and `base` is ignored.
+    ///
+    /// When `base` is `None` the default PIE base (`0x0040_0000`) is used, which
+    /// matches IDA's default load address for Linux PIE ELF shared libraries.
+    pub fn load_with_base(path: &Path, base: Option<u64>) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
@@ -144,7 +157,7 @@ impl LoadedBinary {
 
         let mut bss_bufs: Vec<Box<[u8]>> = Vec::new();
         let (arch, segments, entry_points, symbols, pie_base, got_map) =
-            parse_binary(bytes, &mut bss_bufs)?;
+            parse_binary(bytes, &mut bss_bufs, base)?;
 
         Ok(LoadedBinary {
             arch,
@@ -252,9 +265,13 @@ fn alloc_bss(size: usize, bufs: &mut Vec<Box<[u8]>>) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(ptr, size) }
 }
 
-fn parse_binary(bytes: &'static [u8], bss_bufs: &mut Vec<Box<[u8]>>) -> ParseResult {
+fn parse_binary(
+    bytes: &'static [u8],
+    bss_bufs: &mut Vec<Box<[u8]>>,
+    base: Option<u64>,
+) -> ParseResult {
     match Object::parse(bytes)? {
-        Object::Elf(elf) => parse_elf(bytes, &elf, bss_bufs),
+        Object::Elf(elf) => parse_elf(bytes, &elf, bss_bufs, base),
         Object::Mach(goblin::mach::Mach::Binary(macho)) => parse_macho(bytes, &macho, bss_bufs),
         Object::Mach(goblin::mach::Mach::Fat(_)) => {
             Err(anyhow!("fat (universal) Mach-O binaries are not supported; extract the desired arch slice first (e.g. with `lipo -extract`)"))
@@ -359,6 +376,7 @@ fn parse_elf(
     bytes: &'static [u8],
     elf: &goblin::elf::Elf,
     bss_bufs: &mut Vec<Box<[u8]>>,
+    base_override: Option<u64>,
 ) -> ParseResult {
     let arch = match elf.header.e_machine {
         goblin::elf::header::EM_X86_64 => Arch::X86_64,
@@ -444,6 +462,9 @@ fn parse_elf(
     // zero-based one in the file) still trigger rebasing correctly.
     use goblin::elf::header::ET_DYN;
     use goblin::elf::program_header::PT_LOAD;
+    // Determine the base VA for PIE ELF binaries (ET_DYN with first PT_LOAD at 0).
+    // base_override lets the caller specify an explicit load address; otherwise
+    // the traditional Linux PIE base 0x0040_0000 is used (matches IDA default).
     let pie_base: u64 = if elf.header.e_type == ET_DYN {
         let min_load_va = elf
             .program_headers
@@ -453,7 +474,7 @@ fn parse_elf(
             .min()
             .unwrap_or(1);
         if min_load_va == 0 {
-            0x0040_0000
+            base_override.unwrap_or(0x0040_0000)
         } else {
             0
         }

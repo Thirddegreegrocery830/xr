@@ -15,6 +15,14 @@ struct Cli {
     /// desired slice first with `lipo -extract <arch> <input> -output <output>`.
     binary: PathBuf,
 
+    /// Override the load base VA for PIE ELF binaries (hex or decimal).
+    /// By default PIE ELFs (ET_DYN with first PT_LOAD at 0) are rebased to
+    /// 0x400000. Use this to match a specific runtime load address or to
+    /// reproduce IDA's layout for a different base.
+    /// Ignored for non-PIE ELF, Mach-O, and PE.
+    #[arg(long, value_parser = parse_va)]
+    base: Option<u64>,
+
     /// Analysis depth
     #[arg(short, long, default_value = "paired")]
     depth: DepthArg,
@@ -106,7 +114,7 @@ fn main() -> Result<()> {
     };
 
     eprintln!("loading {}...", cli.binary.display());
-    let binary = LoadedBinary::load(&cli.binary)?;
+    let binary = LoadedBinary::load_with_base(&cli.binary, cli.base)?;
     eprintln!(
         "arch={:?}  segments={}  entry_points={}",
         binary.arch,
