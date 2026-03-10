@@ -5,7 +5,7 @@ use std::io::Write as _;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use xr::output::{ContextLine, CsvPrinter, JsonPrinter, Printer, TextPrinter, XrefRecord};
-use xr::{Depth, LoadedBinary, PassConfig, XrefPass};
+use xr::{parse_va, Depth, LoadedBinary, PassConfig, XrefPass};
 
 #[derive(Parser)]
 #[command(name = "xr", about = "Fast multi-level xref extraction")]
@@ -93,15 +93,6 @@ enum OutputFormat {
     Text,
     Json,
     Csv,
-}
-
-/// Parse a VA from a string — accepts `0x`-prefixed hex or plain decimal.
-fn parse_va(s: &str) -> Result<u64, String> {
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
-    } else {
-        s.parse::<u64>().map_err(|e| e.to_string())
-    }
 }
 
 fn main() -> Result<()> {

@@ -858,6 +858,299 @@ mod tests {
         }
     }
 
+    // ── from_range (--start / --end) ──────────────────────────────────────────
+
+    /// from_range exactly covering the full segment: all xrefs emitted.
+    #[test]
+    fn test_from_range_full_coverage() {
+        let base_va = 0x1000u64;
+        let target_va = 0x100000u64;
+        let n = 16usize;
+        let words: Vec<u32> = (0..n)
+            .map(|i| arm64_bl(base_va + i as u64 * 4, target_va))
+            .collect();
+        let seg_end = base_va + n as u64 * 4;
+        let code_seg = make_code_seg(base_va, words);
+        let tgt_seg = make_code_seg(target_va, vec![arm64_nop()]);
+        let binary = make_binary(Arch::Arm64, vec![code_seg, tgt_seg]);
+
+        let mut xrefs = Vec::new();
+        XrefPass::new(
+            &binary,
+            PassConfig {
+                depth: Depth::Linear,
+                workers: 1,
+                from_range: Some((base_va, seg_end)),
+                ..Default::default()
+            },
+        )
+        .run(|batch| {
+            xrefs.extend_from_slice(batch);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(xrefs.len(), n, "full from_range should emit all {n} xrefs");
+    }
+
+    /// from_range covering only the first half: only the first-half xrefs emitted.
+    #[test]
+    fn test_from_range_first_half() {
+        let base_va = 0x2000u64;
+        let target_va = 0x200000u64;
+        let n = 32usize;
+        let words: Vec<u32> = (0..n)
+            .map(|i| arm64_bl(base_va + i as u64 * 4, target_va))
+            .collect();
+        let midpoint = base_va + (n / 2) as u64 * 4;
+        let code_seg = make_code_seg(base_va, words);
+        let tgt_seg = make_code_seg(target_va, vec![arm64_nop()]);
+        let binary = make_binary(Arch::Arm64, vec![code_seg, tgt_seg]);
+
+        let mut xrefs = Vec::new();
+        XrefPass::new(
+            &binary,
+            PassConfig {
+                depth: Depth::Linear,
+                workers: 1,
+                from_range: Some((base_va, midpoint)),
+                ..Default::default()
+            },
+        )
+        .run(|batch| {
+            xrefs.extend_from_slice(batch);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(xrefs.len(), n / 2, "first-half from_range");
+        assert!(
+            xrefs.iter().all(|x| x.from < midpoint),
+            "all froms below midpoint"
+        );
+    }
+
+    /// from_range covering only the second half.
+    #[test]
+    fn test_from_range_second_half() {
+        let base_va = 0x3000u64;
+        let target_va = 0x300000u64;
+        let n = 32usize;
+        let words: Vec<u32> = (0..n)
+            .map(|i| arm64_bl(base_va + i as u64 * 4, target_va))
+            .collect();
+        let midpoint = base_va + (n / 2) as u64 * 4;
+        let seg_end = base_va + n as u64 * 4;
+        let code_seg = make_code_seg(base_va, words);
+        let tgt_seg = make_code_seg(target_va, vec![arm64_nop()]);
+        let binary = make_binary(Arch::Arm64, vec![code_seg, tgt_seg]);
+
+        let mut xrefs = Vec::new();
+        XrefPass::new(
+            &binary,
+            PassConfig {
+                depth: Depth::Linear,
+                workers: 1,
+                from_range: Some((midpoint, seg_end)),
+                ..Default::default()
+            },
+        )
+        .run(|batch| {
+            xrefs.extend_from_slice(batch);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(xrefs.len(), n / 2, "second-half from_range");
+        assert!(
+            xrefs.iter().all(|x| x.from >= midpoint),
+            "all froms at or above midpoint"
+        );
+    }
+
+    /// from_range entirely outside the segment: zero xrefs emitted.
+    #[test]
+    fn test_from_range_no_overlap() {
+        let base_va = 0x4000u64;
+        let target_va = 0x400000u64;
+        let n = 16usize;
+        let words: Vec<u32> = (0..n)
+            .map(|i| arm64_bl(base_va + i as u64 * 4, target_va))
+            .collect();
+        let code_seg = make_code_seg(base_va, words);
+        let tgt_seg = make_code_seg(target_va, vec![arm64_nop()]);
+        let binary = make_binary(Arch::Arm64, vec![code_seg, tgt_seg]);
+
+        let mut xrefs = Vec::new();
+        XrefPass::new(
+            &binary,
+            PassConfig {
+                depth: Depth::Linear,
+                workers: 1,
+                from_range: Some((0xffff_0000, 0xffff_1000)), // nowhere near base_va
+                ..Default::default()
+            },
+        )
+        .run(|batch| {
+            xrefs.extend_from_slice(batch);
+            ControlFlow::Continue(())
+        });
+        assert!(
+            xrefs.is_empty(),
+            "from_range outside segment must yield no xrefs"
+        );
+    }
+
+    /// from_range with multiple workers: range filtering + no duplicates.
+    #[test]
+    fn test_from_range_multi_worker() {
+        let base_va = 0x5000u64;
+        let target_va = 0x500000u64;
+        let n = 64usize;
+        let words: Vec<u32> = (0..n)
+            .map(|i| arm64_bl(base_va + i as u64 * 4, target_va))
+            .collect();
+        // Scan only the middle quarter.
+        let q1 = base_va + (n / 4) as u64 * 4;
+        let q3 = base_va + (3 * n / 4) as u64 * 4;
+        let code_seg = make_code_seg(base_va, words);
+        let tgt_seg = make_code_seg(target_va, vec![arm64_nop()]);
+        let binary = make_binary(Arch::Arm64, vec![code_seg, tgt_seg]);
+
+        for workers in [2, 4, 8] {
+            let mut xrefs = Vec::new();
+            XrefPass::new(
+                &binary,
+                PassConfig {
+                    depth: Depth::Linear,
+                    workers,
+                    from_range: Some((q1, q3)),
+                    ..Default::default()
+                },
+            )
+            .run(|batch| {
+                xrefs.extend_from_slice(batch);
+                ControlFlow::Continue(())
+            });
+            assert_no_duplicates(&xrefs);
+            assert_eq!(
+                xrefs.len(),
+                n / 2,
+                "workers={workers}: middle-half from_range"
+            );
+            assert!(xrefs.iter().all(|x| x.from >= q1 && x.from < q3));
+        }
+    }
+
+    // ── to_range (--ref-start / --ref-end) ────────────────────────────────────
+
+    /// to_range exactly matching the target: all xrefs pass through.
+    #[test]
+    fn test_to_range_full_pass() {
+        let base_va = 0x6000u64;
+        let target_va = 0x600000u64;
+        let n = 16usize;
+        let words: Vec<u32> = (0..n)
+            .map(|i| arm64_bl(base_va + i as u64 * 4, target_va))
+            .collect();
+        let code_seg = make_code_seg(base_va, words);
+        let tgt_seg = make_code_seg(target_va, vec![arm64_nop()]);
+        let binary = make_binary(Arch::Arm64, vec![code_seg, tgt_seg]);
+
+        let mut xrefs = Vec::new();
+        XrefPass::new(
+            &binary,
+            PassConfig {
+                depth: Depth::Linear,
+                workers: 1,
+                to_range: Some((target_va, target_va + 4)),
+                ..Default::default()
+            },
+        )
+        .run(|batch| {
+            xrefs.extend_from_slice(batch);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(
+            xrefs.len(),
+            n,
+            "to_range covering target should pass all xrefs"
+        );
+    }
+
+    /// to_range that excludes the target: zero xrefs pass through.
+    #[test]
+    fn test_to_range_excludes_all() {
+        let base_va = 0x7000u64;
+        let target_va = 0x700000u64;
+        let n = 16usize;
+        let words: Vec<u32> = (0..n)
+            .map(|i| arm64_bl(base_va + i as u64 * 4, target_va))
+            .collect();
+        let code_seg = make_code_seg(base_va, words);
+        let tgt_seg = make_code_seg(target_va, vec![arm64_nop()]);
+        let binary = make_binary(Arch::Arm64, vec![code_seg, tgt_seg]);
+
+        let mut xrefs = Vec::new();
+        XrefPass::new(
+            &binary,
+            PassConfig {
+                depth: Depth::Linear,
+                workers: 1,
+                to_range: Some((0x1000_0000, 0x2000_0000)), // far from target_va
+                ..Default::default()
+            },
+        )
+        .run(|batch| {
+            xrefs.extend_from_slice(batch);
+            ControlFlow::Continue(())
+        });
+        assert!(
+            xrefs.is_empty(),
+            "to_range excluding target should yield no xrefs"
+        );
+    }
+
+    /// from_range and to_range combined: intersection of both filters.
+    #[test]
+    fn test_from_range_and_to_range_combined() {
+        // Two code segments, each with BL instructions pointing to different targets.
+        let base_a = 0x8000u64;
+        let base_b = 0x9000u64;
+        let target_a = 0x800000u64;
+        let target_b = 0x900000u64;
+        let n = 8usize;
+
+        let words_a: Vec<u32> = (0..n)
+            .map(|i| arm64_bl(base_a + i as u64 * 4, target_a))
+            .collect();
+        let words_b: Vec<u32> = (0..n)
+            .map(|i| arm64_bl(base_b + i as u64 * 4, target_b))
+            .collect();
+
+        let seg_a = make_code_seg(base_a, words_a);
+        let seg_b = make_code_seg(base_b, words_b);
+        let tgt_a = make_code_seg(target_a, vec![arm64_nop()]);
+        let tgt_b = make_code_seg(target_b, vec![arm64_nop()]);
+        let binary = make_binary(Arch::Arm64, vec![seg_a, seg_b, tgt_a, tgt_b]);
+
+        // Restrict from to seg_a only, and to to target_a only.
+        let mut xrefs = Vec::new();
+        XrefPass::new(
+            &binary,
+            PassConfig {
+                depth: Depth::Linear,
+                workers: 1,
+                from_range: Some((base_a, base_a + n as u64 * 4)),
+                to_range: Some((target_a, target_a + 4)),
+                ..Default::default()
+            },
+        )
+        .run(|batch| {
+            xrefs.extend_from_slice(batch);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(xrefs.len(), n, "combined filter: only seg_a→target_a xrefs");
+        assert!(xrefs
+            .iter()
+            .all(|x| x.from >= base_a && x.from < base_a + n as u64 * 4));
+        assert!(xrefs.iter().all(|x| x.to == target_a));
+    }
+
     /// Multiple segments: uniqueness must hold across all segments combined.
     #[test]
     fn test_no_duplicates_multiple_segments() {

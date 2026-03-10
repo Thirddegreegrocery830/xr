@@ -950,3 +950,185 @@ fn parse_pe(
 
     Ok((arch, segments, entry_points, symbols, 0, HashMap::new()))
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build a minimal valid 64-bit PIE ELF (ET_DYN, EM_X86_64) with a single
+    /// PT_LOAD at p_vaddr=0 and a .text section at raw vaddr 0x1000.
+    /// Written to a tempfile and passed to `LoadedBinary::load_with_base` in tests.
+    fn make_minimal_pie_elf() -> Vec<u8> {
+        // File layout:
+        //   0x00..0x40   ELF header (Ehdr64, 64 bytes)
+        //   0x40..0x78   Program header (Phdr64, 56 bytes)
+        //   0x78..0x80   .shstrtab content: b"\x00.text\x00" (8 bytes)
+        //   0x80..0xc0   .text: 64 zero bytes
+        //   0xc0..0x180  Section header table: 3 × Shdr64 (64 bytes each)
+
+        let shstrtab_off: u64 = 0x78;
+        let shstrtab_content: &[u8] = b"\x00.text\x00";
+        let shstrtab_size = shstrtab_content.len() as u64;
+
+        let text_off: u64 = shstrtab_off + shstrtab_size; // 0x80
+        let text_size: u64 = 64;
+        // text_vaddr == text_off: the section lives at file offset 0x80, and
+        // since p_vaddr=0 / p_offset=0 the raw vaddr equals the file offset.
+        // This places it squarely within the PT_LOAD's [0, file_size) range.
+        let text_vaddr: u64 = text_off; // 0x80
+
+        let shoff: u64 = text_off + text_size; // 0xc0
+        let file_size: u64 = shoff + 3 * 64; // 0x180
+
+        let mut buf = vec![0u8; file_size as usize];
+
+        // Helper: write `n` LE bytes of `val` at offset `off`.
+        fn w(buf: &mut [u8], off: usize, val: u64, n: usize) {
+            buf[off..off + n].copy_from_slice(&val.to_le_bytes()[..n]);
+        }
+
+        // ── ELF header ────────────────────────────────────────────────────────
+        buf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        buf[4] = 2; // ELFCLASS64
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+
+        let h = 16usize; // start of fields after e_ident
+        w(&mut buf, h, 3, 2); // e_type = ET_DYN
+        w(&mut buf, h + 2, 62, 2); // e_machine = EM_X86_64
+        w(&mut buf, h + 4, 1, 4); // e_version
+        w(&mut buf, h + 8, 0, 8); // e_entry
+        w(&mut buf, h + 16, 0x40, 8); // e_phoff
+        w(&mut buf, h + 24, shoff, 8); // e_shoff
+        w(&mut buf, h + 32, 0, 4); // e_flags
+        w(&mut buf, h + 36, 64, 2); // e_ehsize
+        w(&mut buf, h + 38, 56, 2); // e_phentsize
+        w(&mut buf, h + 40, 1, 2); // e_phnum
+        w(&mut buf, h + 42, 64, 2); // e_shentsize
+        w(&mut buf, h + 44, 3, 2); // e_shnum
+        w(&mut buf, h + 46, 1, 2); // e_shstrndx = 1 (.shstrtab)
+
+        // ── PT_LOAD at p_vaddr=0 (PIE) ────────────────────────────────────────
+        let ph = 0x40usize;
+        w(&mut buf, ph, 1, 4); // p_type = PT_LOAD
+        w(&mut buf, ph + 4, 0x5, 4); // p_flags = PF_R|PF_X
+        w(&mut buf, ph + 8, 0, 8); // p_offset = 0
+        w(&mut buf, ph + 16, 0, 8); // p_vaddr = 0  ← PIE
+        w(&mut buf, ph + 24, 0, 8); // p_paddr
+        w(&mut buf, ph + 32, file_size, 8); // p_filesz
+        w(&mut buf, ph + 40, file_size, 8); // p_memsz
+        w(&mut buf, ph + 48, 0x1000, 8); // p_align
+
+        // ── .shstrtab ─────────────────────────────────────────────────────────
+        buf[shstrtab_off as usize..shstrtab_off as usize + shstrtab_content.len()]
+            .copy_from_slice(shstrtab_content);
+
+        // ── Section 0: null (all zeros) ───────────────────────────────────────
+
+        // ── Section 1: .shstrtab ──────────────────────────────────────────────
+        let s1 = shoff as usize + 64;
+        w(&mut buf, s1, 0, 4); // sh_name = 0 (empty — minimal)
+        w(&mut buf, s1 + 4, 3, 4); // sh_type = SHT_STRTAB
+        w(&mut buf, s1 + 8, 0, 8); // sh_flags (not SHF_ALLOC — not runtime-mapped)
+        w(&mut buf, s1 + 16, 0, 8); // sh_addr = 0 (not mapped, parse_elf skips sh_addr==0)
+        w(&mut buf, s1 + 24, shstrtab_off, 8); // sh_offset
+        w(&mut buf, s1 + 32, shstrtab_size, 8); // sh_size
+        w(&mut buf, s1 + 48, 1, 8); // sh_addralign
+
+        // ── Section 2: .text ──────────────────────────────────────────────────
+        let s2 = shoff as usize + 128;
+        w(&mut buf, s2, 1, 4); // sh_name = 1 → ".text" in shstrtab
+        w(&mut buf, s2 + 4, 1, 4); // sh_type = SHT_PROGBITS
+        w(&mut buf, s2 + 8, 0x6, 8); // sh_flags = SHF_ALLOC|SHF_EXECINSTR
+        w(&mut buf, s2 + 16, text_vaddr, 8); // sh_addr = 0x1000 (raw, pre-rebase)
+        w(&mut buf, s2 + 24, text_off, 8); // sh_offset
+        w(&mut buf, s2 + 32, text_size, 8); // sh_size
+        w(&mut buf, s2 + 48, 0x10, 8); // sh_addralign
+
+        buf
+    }
+
+    fn write_tmp(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+        tmp
+    }
+
+    /// Load the same ELF at three different bases and check that every segment
+    /// VA is exactly `pie_base` more than the corresponding raw-base VA.
+    /// This tests the core rebasing invariant without depending on exact layout
+    /// offsets that would have to be kept in sync with make_minimal_pie_elf.
+    fn segment_vas(elf: &[u8], base: Option<u64>) -> Vec<u64> {
+        let tmp = write_tmp(elf);
+        let bin = LoadedBinary::load_with_base(tmp.path(), base).unwrap();
+        let mut vas: Vec<u64> = bin.segments.iter().map(|s| s.va).collect();
+        vas.sort_unstable();
+        vas
+    }
+
+    /// Default load uses 0x400000 as the PIE base.
+    #[test]
+    fn test_load_pie_default_base() {
+        let elf = make_minimal_pie_elf();
+        let tmp = write_tmp(&elf);
+        let binary = LoadedBinary::load(tmp.path()).unwrap();
+        assert_eq!(binary.pie_base, 0x0040_0000);
+        // Every segment VA must be >= pie_base (they were raw-vaddr=0 or small offsets).
+        assert!(
+            binary.segments.iter().all(|s| s.va >= 0x0040_0000),
+            "all segment VAs should be rebased above 0x400000, got: {:?}",
+            binary.segments.iter().map(|s| s.va).collect::<Vec<_>>()
+        );
+    }
+
+    /// Overriding base to 0 leaves VAs unrelocated (raw file VAs).
+    #[test]
+    fn test_load_pie_base_zero() {
+        let elf = make_minimal_pie_elf();
+        let raw_vas = segment_vas(&elf, Some(0));
+        let tmp = write_tmp(&elf);
+        let binary = LoadedBinary::load_with_base(tmp.path(), Some(0)).unwrap();
+        assert_eq!(binary.pie_base, 0);
+        // With base=0 segment VAs equal the raw (unrelocated) values.
+        let mut got: Vec<u64> = binary.segments.iter().map(|s| s.va).collect();
+        got.sort_unstable();
+        assert_eq!(got, raw_vas, "base=0 should not shift VAs");
+    }
+
+    /// Overriding base applies an exact shift to every segment VA.
+    #[test]
+    fn test_load_pie_custom_base() {
+        let elf = make_minimal_pie_elf();
+        let raw_vas = segment_vas(&elf, Some(0));
+        let custom_base = 0x7f00_0000u64;
+        let tmp = write_tmp(&elf);
+        let binary = LoadedBinary::load_with_base(tmp.path(), Some(custom_base)).unwrap();
+        assert_eq!(binary.pie_base, custom_base);
+        let mut got: Vec<u64> = binary.segments.iter().map(|s| s.va).collect();
+        got.sort_unstable();
+        let expected: Vec<u64> = raw_vas.iter().map(|v| v + custom_base).collect();
+        assert_eq!(
+            got, expected,
+            "custom base should shift all VAs by exactly custom_base"
+        );
+    }
+
+    /// Different base values produce consistently shifted VAs relative to each other.
+    #[test]
+    fn test_load_pie_base_shift_consistency() {
+        let elf = make_minimal_pie_elf();
+        let base_a = 0x0040_0000u64;
+        let base_b = 0x0080_0000u64;
+        let vas_a = segment_vas(&elf, Some(base_a));
+        let vas_b = segment_vas(&elf, Some(base_b));
+        assert_eq!(vas_a.len(), vas_b.len(), "same number of segments");
+        let delta = base_b - base_a;
+        for (a, b) in vas_a.iter().zip(vas_b.iter()) {
+            assert_eq!(b - a, delta, "VA shift mismatch: {a:#x} vs {b:#x}");
+        }
+    }
+}
