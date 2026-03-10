@@ -172,3 +172,14 @@ With `-B`/`-A`, each object gains a `"context"` array of `{va, hex, text, focus}
 - **Fat Mach-O**: if `xr` rejects the binary, run `lipo -extract arm64 binary thin` first.
 - **ARM64 indirect calls** (BLR xN) resolved via ADRP+ADD pairing are emitted as `call` with `pair-resolved` confidence.
 - **False positives**: `byte-scan` confidence entries are speculative. Filter them out with `-k call` or `-k data_read` when you want only decoded references.
+- **No xrefs found? Widen the target range.** Binaries have strong address locality — related functions cluster together. If searching for refs to `0x401234` turns up nothing (e.g. the target is reached via an indirect call that wasn't resolved), try widening `--ref-end` to cover the whole function or the surrounding ~0x100–0x1000 byte neighborhood. Refs to nearby addresses are likely from the same callers.
+
+  ```bash
+  # Nothing found for exact address — try the whole function body
+  xr binary --ref-start 0x401200 --ref-end 0x401400 -k call
+
+  # Or scan neighbors: anything referencing the page around 0x401234
+  xr binary --ref-start 0x401000 --ref-end 0x402000 -k call
+  ```
+
+  Similarly, if you find refs to a neighbor function `0x401300`, the caller likely also calls or is adjacent to your target — pivot to scanning that caller's range (`--start`/`--end`) to see what else it references.
