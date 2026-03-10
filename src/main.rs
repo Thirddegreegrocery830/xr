@@ -51,6 +51,23 @@ struct Cli {
     /// Cap output at N xrefs (0 = unlimited).
     #[arg(long, default_value = "0")]
     limit: usize,
+
+    /// Restrict scanning to `from` addresses >= this VA (hex or decimal).
+    /// Segments entirely below this address are skipped — no decode work wasted.
+    #[arg(long, value_parser = parse_va)]
+    start: Option<u64>,
+
+    /// Restrict scanning to `from` addresses < this VA (hex or decimal).
+    #[arg(long, value_parser = parse_va)]
+    end: Option<u64>,
+
+    /// Retain only xrefs whose `to` address >= this VA (hex or decimal).
+    #[arg(long, value_parser = parse_va)]
+    ref_start: Option<u64>,
+
+    /// Retain only xrefs whose `to` address < this VA (hex or decimal).
+    #[arg(long, value_parser = parse_va)]
+    ref_end: Option<u64>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -68,6 +85,15 @@ enum OutputFormat {
     Text,
     Json,
     Csv,
+}
+
+/// Parse a VA from a string — accepts `0x`-prefixed hex or plain decimal.
+fn parse_va(s: &str) -> Result<u64, String> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
+    } else {
+        s.parse::<u64>().map_err(|e| e.to_string())
+    }
 }
 
 fn main() -> Result<()> {
@@ -89,10 +115,26 @@ fn main() -> Result<()> {
     );
 
     let min_ref_va = cli.min_ref_va.unwrap_or_else(|| binary.min_va());
+
+    let from_range = match (cli.start, cli.end) {
+        (Some(lo), Some(hi)) => Some((lo, hi)),
+        (Some(lo), None) => Some((lo, u64::MAX)),
+        (None, Some(hi)) => Some((0, hi)),
+        (None, None) => None,
+    };
+    let to_range = match (cli.ref_start, cli.ref_end) {
+        (Some(lo), Some(hi)) => Some((lo, hi)),
+        (Some(lo), None) => Some((lo, u64::MAX)),
+        (None, Some(hi)) => Some((0, hi)),
+        (None, None) => None,
+    };
+
     let config = PassConfig {
         depth,
         workers: cli.workers,
         min_ref_va,
+        from_range,
+        to_range,
         ..Default::default()
     };
     eprintln!(

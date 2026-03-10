@@ -41,6 +41,15 @@ pub struct PassConfig {
     /// (which may be 0x0 for firmware or flat images), causing this filter to
     /// become a no-op — no xrefs are incorrectly dropped in that case.
     pub min_ref_va: u64,
+    /// Restrict scanning to xrefs whose `from` address falls in `[start, end)`.
+    /// Applied at shard-generation time — segments outside the range are skipped
+    /// entirely, so no decode work is wasted.
+    /// `None` = no restriction (scan everything).
+    pub from_range: Option<(u64, u64)>,
+    /// Retain only xrefs whose `to` address falls in `[start, end)`.
+    /// Applied as a post-filter after scanning.
+    /// `None` = no restriction.
+    pub to_range: Option<(u64, u64)>,
 }
 
 impl Default for PassConfig {
@@ -50,6 +59,8 @@ impl Default for PassConfig {
             workers: 0,
             boundary_overlap: 64, // 16 ARM64 instructions of lookahead
             min_ref_va: 0,
+            from_range: None,
+            to_range: None,
         }
     }
 }
@@ -148,6 +159,8 @@ impl<'a> XrefPass<'a> {
         let depth = self.config.depth;
         let overlap = self.config.boundary_overlap;
         let min_ref_va = self.config.min_ref_va;
+        let from_range = self.config.from_range;
+        let to_range = self.config.to_range;
 
         // Build the segment indices once — both shared across all shards via reference.
         // SegmentIndex: flags-only O(log n) membership/exec checks.
@@ -182,17 +195,26 @@ impl<'a> XrefPass<'a> {
             .code_segments()
             .flat_map(|seg| {
                 let seg_end = seg.va + seg.data.len() as u64;
-                let shards = split_range(seg.va, seg_end, n_workers, overlap, insn_align);
+                // Clamp to from_range before sharding — segments with no overlap
+                // produce an empty shard list and are skipped entirely.
+                let (scan_start, scan_end) = match from_range {
+                    Some((lo, hi)) => (seg.va.max(lo), seg_end.min(hi)),
+                    None => (seg.va, seg_end),
+                };
+                if scan_start >= scan_end {
+                    return vec![];
+                }
+                let shards = split_range(scan_start, scan_end, n_workers, overlap, insn_align);
                 let n = shards.len();
-                // Collect starts so we can look ahead.
                 let starts: Vec<u64> = shards.iter().map(|(s, _)| *s).collect();
                 shards
                     .into_iter()
                     .enumerate()
                     .map(move |(i, (start, end))| {
-                        let owned_end = if i + 1 < n { starts[i + 1] } else { seg_end };
+                        let owned_end = if i + 1 < n { starts[i + 1] } else { scan_end };
                         (seg, start, end, owned_end)
                     })
+                    .collect()
             })
             .collect();
 
@@ -200,9 +222,18 @@ impl<'a> XrefPass<'a> {
             self.binary
                 .scannable_data_segments()
                 .flat_map(|seg| {
+                    let seg_end = seg.va + seg.data.len() as u64;
+                    // Clamp to from_range (data pointers are emitted at their source VA).
+                    let (scan_start, scan_end) = match from_range {
+                        Some((lo, hi)) => (seg.va.max(lo), seg_end.min(hi)),
+                        None => (seg.va, seg_end),
+                    };
+                    if scan_start >= scan_end {
+                        return vec![];
+                    }
                     let shards = split_range(
-                        seg.va,
-                        seg.va + seg.data.len() as u64,
+                        scan_start,
+                        scan_end,
                         n_workers,
                         0,
                         // Align shard boundaries to pointer size so that
@@ -216,6 +247,7 @@ impl<'a> XrefPass<'a> {
                     shards
                         .into_iter()
                         .map(move |(start, end)| (seg, start, end))
+                        .collect()
                 })
                 .collect()
         } else {
@@ -300,7 +332,9 @@ impl<'a> XrefPass<'a> {
                         }
                         let mut batch = scan_shard(seg, start, end, arch, depth, &ctx);
                         batch.retain(|x| {
-                            x.from < owned_end && (min_ref_va == 0 || x.to >= min_ref_va)
+                            x.from < owned_end
+                                && (min_ref_va == 0 || x.to >= min_ref_va)
+                                && to_range.is_none_or(|(lo, hi)| x.to >= lo && x.to < hi)
                         });
                         if !batch.is_empty() {
                             let _ = tx.send(batch);
@@ -317,7 +351,10 @@ impl<'a> XrefPass<'a> {
                         }
                         let region = ScanRegion::new(seg, start, end);
                         let mut batch = arch::byte_scan_pointers(&region, ctx.data_idx, ptr_size);
-                        batch.retain(|x| min_ref_va == 0 || x.to >= min_ref_va);
+                        batch.retain(|x| {
+                            (min_ref_va == 0 || x.to >= min_ref_va)
+                                && to_range.is_none_or(|(lo, hi)| x.to >= lo && x.to < hi)
+                        });
                         if !batch.is_empty() {
                             let _ = tx.send(batch);
                         }
