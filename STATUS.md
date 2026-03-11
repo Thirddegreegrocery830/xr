@@ -25,33 +25,33 @@ ground-truth xrefs. Maximise F1 score across all xref kinds.
 
 | Kind       | TP     | FP   | FN    | Prec  | Rec   | F1    |
 |------------|--------|------|-------|-------|-------|-------|
-| call       |  62804 |   35 |    42 | 0.999 | 0.999 | 0.999 |
-| jump       | 105982 | 5785 |  3450 | 0.948 | 0.968 | 0.958 |
+| call       |  62805 |   35 |    41 | 0.999 | 0.999 | 0.999 |
+| jump       | 109029 | 5807 |   403 | 0.949 | 0.996 | 0.972 |
 | data_read  |   3927 |    1 |   465 | 1.000 | 0.894 | 0.944 |
 | data_write |    510 |    0 |     0 | 1.000 | 1.000 | 1.000 |
-| data_ptr   |  26372 |   57 |  6164 | 0.998 | 0.811 | 0.894 |
-| **overall**|**199595**|**5878**|**10121**|**0.971**|**0.952**|**0.961**|
+| data_ptr   |  26373 |   57 |  6163 | 0.998 | 0.811 | 0.895 |
+| **overall**|**202644**|**5900**|**7072**|**0.972**|**0.966**|**0.969**|
 
 ### blackcat.elf (x86-64 PIE ELF, large)
 
 | Kind       | TP    | FP  | FN    | Prec  | Rec   | F1    |
 |------------|-------|-----|-------|-------|-------|-------|
 | call       | 15643 |  73 |  1110 | 0.995 | 0.934 | 0.964 |
-| jump       | 49671 | 795 |  2727 | 0.984 | 0.948 | 0.966 |
+| jump       | 50029 | 812 |  2369 | 0.984 | 0.955 | 0.969 |
 | data_read  |  8750 |   2 |   494 | 1.000 | 0.947 | 0.972 |
 | data_write |   170 |   1 |    19 | 0.994 | 0.899 | 0.944 |
 | data_ptr   | 10864 |  12 |  2872 | 0.999 | 0.791 | 0.883 |
-| **overall**|**79645**|**881**|**7222**|**0.989**|**0.917**|**0.952**|
+| **overall**|**80003**|**895**|**6864**|**0.989**|**0.921**|**0.954**|
 
 ### libharlem-shake.so (x86-64 PIE ELF, external symbol calls)
 
 | Kind       | TP    | FP  | FN    | Prec  | Rec   | F1    |
 |------------|-------|-----|-------|-------|-------|-------|
-| call       |  8235 | 456 |   711 | 0.948 | 0.921 | 0.934 |
-| jump       | 15169 |   5 |   756 | 1.000 | 0.953 | 0.976 |
+| call       |  8234 | 456 |   712 | 0.948 | 0.920 | 0.934 |
+| jump       | 15512 |   7 |   413 | 1.000 | 0.974 | 0.987 |
 | data_read  |  6221 |   0 |    57 | 1.000 | 0.991 | 0.995 |
-| data_ptr   |  4936 |  15 |  8060 | 0.997 | 0.380 | 0.550 |
-| **overall**|**29761**|**17**|**9584**|**0.999**|**0.756**|**0.861**|
+| data_ptr   |  4937 |  15 |  8059 | 0.997 | 0.380 | 0.550 |
+| **overall**|**30104**|**19**|**9241**|**0.999**|**0.765**|**0.867**|
 
 ### libziggy.so (AArch64 PIE ELF)
 
@@ -66,14 +66,16 @@ ground-truth xrefs. Maximise F1 score across all xref kinds.
 
 | Binary | Overall F1 |
 |--------|------------|
-| hello-linux-gcc (x86-64 PIE ELF) | 0.897 |
-| libssl3-amd64.so.3 (x86-64 ELF) | 0.916 |
+| hello-linux-gcc (x86-64 PIE ELF) | 0.914 |
+| libssl3-amd64.so.3 (x86-64 ELF) | 0.925 |
 | libcurl-arm64.so (AArch64 ELF)   | 0.902 |
 | libcurl-x86.so (x86-64 ELF)     | 0.954 |
-| libpjsip-everything.so (x86-64)  | 0.910 |
-| hello.aarch64-apple-darwin (Mach-O) | 0.945 |
-| hello.x86_64-pc-windows-gnu.exe (PE) | 0.852 |
-| simple.exe (PE) | 0.730 |
+| libpjsip-everything.so (x86-64)  | 0.911 |
+| hello.aarch64-apple-darwin (Mach-O) | 0.946 |
+| hello.x86_64-pc-windows-gnu.exe (PE) | 0.878 |
+| simple.exe (PE) | 0.736 |
+| sudo.exe (PE) | 0.859 |
+| win32kbase_rs.sys (PE driver) | 0.894 |
 
 ---
 
@@ -344,9 +346,17 @@ Requires significant architecture work (recursive disassembly / flood-fill).
 
 Not planned — substantial complexity for ~+0.006 overall F1 improvement.
 
-#### 3. Register tracking for indirect jumps/calls
+#### 3. x86-64 jump table recovery — DONE
 
-Data-flow analysis to resolve `JMP Rn` / `BR Xn`. Would recover ~3160–3448 jump FNs.
+Recognises the CMP+JA+LEA+MOVSXD+ADD+JMP pattern. Reads i32 offset tables from
+.rodata, computes targets, emits Jump xrefs. CMP bound tracking per register limits
+table size precisely. curl-amd64 jump FN 3448→403 (+3045 TPs), overall F1 0.961→0.969.
+No regressions on any binary. ARM64 not yet implemented.
+
+#### 4. Register tracking for indirect jumps/calls
+
+Data-flow analysis to resolve `JMP Rn` / `BR Xn`. Would recover remaining ~400 jump FNs
+on x86-64 (tables where CMP bound tracking failed) and ~3160 on ARM64.
 Not planned — requires interprocedural analysis.
 
 #### 4. Relocation-derived data_ptr recovery — DONE (ELF + PE)
@@ -428,6 +438,8 @@ xr/
 | x86-64 LEA/MOV/JMP decode | `src/arch/x86_64.rs` | |
 | x86-64 CMP/SUB imm32 data_ptr | `src/arch/x86_64.rs` | `imm_as_address()` helper |
 | GOT-indirect xref emission | `src/arch/x86_64.rs` | `emit_got_indirect()` — FF15/FF25 to got_slot_va |
+| x86-64 jump table recovery | `src/arch/x86_64.rs` | `recover_jump_table()` + `update_jt_state()` + `update_cmp_state()` |
+| SegmentDataIndex::read_i32_at | `src/arch/mod.rs` | Read table entries from any segment |
 | Benchmark GOT normalization | `src/bin/benchmark.rs` | `resolve_x86_got_slot()` + `extern_bound()` |
 | ELF reloc pointer extraction | `src/loader.rs` | `build_elf_reloc_pointers()` — R_*_RELATIVE + R_*_64/ABS64 |
 | PE reloc pointer extraction | `src/loader.rs` | `build_pe_reloc_pointers()` — base reloc table DIR64 entries |
@@ -441,6 +453,47 @@ xr/
 ---
 
 ## Session History (most recent first)
+
+### Session N+8 — x86-64 jump table recovery
+
+**Goal**: Recover jump xrefs from switch-statement jump tables (12.3% of all FNs,
+~3448 jump FNs on curl-amd64).
+
+**Changes:**
+
+1. **`src/arch/mod.rs`** — Added `SegmentDataIndex::read_i32_at()` for reading
+   signed 32-bit table entries from any mapped segment.
+
+2. **`src/arch/x86_64.rs`** — Major additions:
+   - `jt_info: [Option<(u64, u64, Option<u32>)>; 16]` — tracks (table_start,
+     target_base, max_entries) through MOVSXD+ADD propagation
+   - `cmp_bound: [Option<u32>; 16]` — tracks CMP immediate bounds per register,
+     propagated through register-to-register MOV
+   - `update_jt_state()` — recognises MOVSXD [base+idx*4] loads and ADD reg,reg
+     with base-register verification via reg_vals
+   - `update_cmp_state()` — tracks CMP rN,imm → cmp_bound[N] = imm+1, propagated
+     through MOV r,r, cleared by other writes
+   - `recover_jump_table()` — reads i32 offsets from table, computes targets =
+     target_base + offset, emits Jump xrefs. Guarded by CMP bound when available;
+     without CMP bound requires non-exec table segment + small fallback limit.
+   - `scan_with_prop()` and `scan_linear()` now take `data_idx: &SegmentDataIndex`
+
+3. **`src/pass.rs`** — Passes `ctx.data_idx` to x86_64 scanners in `scan_shard`.
+
+**FP mitigation**: Two key guards prevent false positives from dead-code zones:
+- CMP bound tracking limits reads to the exact table size for most tables
+- Without CMP bound: requires table in non-exec segment (.rodata), fallback limit=0
+  (effectively CMP-bound-only recovery avoids all dead-zone FPs)
+
+**Score delta (selected binaries, overall F1):**
+- curl-amd64: 0.961 → **0.969** (+0.008), jump FN 3448→403
+- hello.x86_64-pc-windows-gnu.exe: 0.852 → **0.878** (+0.026)
+- hello-linux-gcc: 0.897 → **0.914** (+0.017)
+- libssl3-amd64.so.3: 0.916 → **0.925** (+0.009)
+- libharmel-shake.so: 0.861 → **0.867** (+0.006)
+- blackcat.elf: 0.952 → **0.954** (+0.002)
+
+No regressions on any of 19 test binaries. ARM64 unaffected (not yet implemented).
 
 ### Session N+7 — Relocation-table data_ptr recovery (ELF + PE)
 

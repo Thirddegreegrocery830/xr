@@ -217,6 +217,23 @@ impl SegmentDataIndex {
     pub(crate) fn flags_at(&self, va: Va) -> Option<u8> {
         self.entry_at(va).map(|(f, _, _, _)| f)
     }
+
+    /// Read a little-endian `i32` at `va` in any mapped segment.
+    /// Returns `None` if `va` is unmapped or the read would overflow the segment.
+    ///
+    /// Unlike `read_u64_at_nonexec`, this does NOT filter by exec flag — jump
+    /// tables may reside in `.rodata` (non-exec) or, rarely, inline in `.text`.
+    #[inline]
+    pub(crate) fn read_i32_at(&self, va: Va) -> Option<i32> {
+        let (_, ptr, len, start) = self.entry_at(va)?;
+        let offset = (va - start) as usize;
+        if offset + 4 > len {
+            return None;
+        }
+        // Safety: same invariant as read_u64_at_nonexec — backing store outlives this index.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), 4) };
+        Some(i32::from_le_bytes(bytes.try_into().unwrap()))
+    }
 }
 
 /// Pointer-width byte scan over a data region.

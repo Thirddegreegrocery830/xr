@@ -10,7 +10,7 @@
 //! values and resolve indirect CALL/JMP where the target is a known constant.
 //! This catches `mov rax, imm64; call rax` patterns.
 
-use super::{ScanRegion, SegmentIndex, XrefSet};
+use super::{ScanRegion, SegmentDataIndex, SegmentIndex, XrefSet};
 use crate::va::Va;
 use crate::xref::{Confidence, Xref, XrefKind};
 use iced_x86::{
@@ -41,16 +41,19 @@ pub(crate) fn scan_linear(
     region: &ScanRegion,
     idx: &SegmentIndex,
     got_slots: &HashSet<Va>,
+    data_idx: &SegmentDataIndex,
 ) -> XrefSet {
-    scan_with_prop(region, idx, got_slots)
+    scan_with_prop(region, idx, got_slots, data_idx)
 }
 
 /// Depth 2: linear disassembly + simple register constant propagation.
-/// Catches `mov rax, imm64 / call rax` and similar patterns.
+/// Catches `mov rax, imm64 / call rax` and similar patterns, plus
+/// jump table recovery (LEA + MOVSXD + ADD + JMP reg).
 pub(crate) fn scan_with_prop(
     region: &ScanRegion,
     idx: &SegmentIndex,
     got_slots: &HashSet<Va>,
+    data_idx: &SegmentDataIndex,
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
@@ -60,6 +63,19 @@ pub(crate) fn scan_with_prop(
 
     // Track known constant values per register (GPRs 0..16 for RAX..R15)
     let mut reg_vals: [Option<u64>; 16] = [None; 16];
+
+    // Jump table state: tracks registers that hold a value loaded from a
+    // jump table (via MOVSXD [base + idx*4]) and propagated through ADD.
+    // (table_start, target_base, max_entries) where:
+    //   table_start  = VA of the first table entry (base_reg_val + disp)
+    //   target_base  = value added to each i32 offset to compute the target
+    //   max_entries  = upper bound from CMP+JA pattern (None = unknown)
+    let mut jt_info: [Option<(u64, u64, Option<u32>)>; 16] = [None; 16];
+
+    // CMP bound tracking: when `CMP rN, imm` is seen, record `imm+1` as the
+    // maximum number of valid table entries for register N. Propagated through
+    // register-to-register MOV so `mov eax, ebx` preserves ebx's bound.
+    let mut cmp_bound: [Option<u32>; 16] = [None; 16];
 
     let mut decoder = Decoder::with_ip(64, data, base, DecoderOptions::NONE);
     let mut insn = Instruction::default();
@@ -100,6 +116,20 @@ pub(crate) fn scan_with_prop(
                                     confidence: Confidence::LocalProp,
                                 });
                             }
+                        } else if insn.code() == Code::Jmp_rm64 {
+                            // Jump table recovery: if the register was loaded
+                            // from a table via MOVSXD+ADD, read all entries.
+                            if let Some((table_start, target_base, max_entries)) = jt_info[ri] {
+                                recover_jump_table(
+                                    va,
+                                    table_start,
+                                    target_base,
+                                    max_entries,
+                                    data_idx,
+                                    idx,
+                                    &mut xrefs,
+                                );
+                            }
                         }
                     }
                 }
@@ -121,7 +151,12 @@ pub(crate) fn scan_with_prop(
             }
         }
 
-        // Update propagation state
+        // Update jump table state (must run BEFORE update_prop_state so it
+        // reads the old reg_vals for base-register verification).
+        update_jt_state(&insn, &reg_vals, &cmp_bound, &mut jt_info);
+
+        // Update CMP bound tracking and propagation state.
+        update_cmp_state(&insn, &mut cmp_bound);
         update_prop_state(&insn, &mut reg_vals);
     }
 
@@ -330,6 +365,222 @@ fn imm_as_address(insn: &Instruction) -> Option<u64> {
     }
 }
 
+/// Maximum number of jump table entries to read before giving up.
+/// Real switch statements rarely exceed ~500 cases; 4096 is a generous
+/// upper bound that prevents runaway reads into adjacent data.
+const MAX_JUMP_TABLE_ENTRIES: usize = 4096;
+
+/// Update jump table tracking state for the current instruction.
+///
+/// Recognises the compiler pattern:
+///   CMP  ridx, IMM                   ; sets cmp_bound[ridx] = IMM+1
+///   JA   default_label               ; unsigned comparison
+///   LEA  rbase, [rip + table]        ; sets reg_vals[rbase] = table_va
+///   MOVSXD roff, [rbase + ridx*4]    ; loads signed 32-bit offset from table
+///   ADD  rtgt, rbase                 ; computes target = offset + base
+///   JMP  rtgt                        ; indirect jump through table
+///
+/// `jt_info[i] = Some((table_start, target_base, max_entries))` means register `i`
+/// currently participates in a jump table dispatch with:
+///   table_start  = VA of the first table entry (for reading i32 offsets)
+///   target_base  = value to add to each offset (the LEA result)
+///   max_entries  = upper bound from CMP+JA (None = unknown, use fallback)
+///
+/// Must be called BEFORE `update_prop_state` / `update_cmp_state` so it reads
+/// old `reg_vals` and `cmp_bound`.
+fn update_jt_state(
+    insn: &Instruction,
+    reg_vals: &[Option<u64>; 16],
+    cmp_bound: &[Option<u32>; 16],
+    jt_info: &mut [Option<(u64, u64, Option<u32>)>; 16],
+) {
+    if insn.op_count() == 0 || insn.op0_kind() != OpKind::Register {
+        return;
+    }
+    let dst = insn.op0_register();
+    let Some(di) = gpr_index(dst) else { return };
+
+    match insn.code() {
+        // MOVSXD r64, [base + idx*4 + disp] — potential jump table load
+        Code::Movsxd_r64_rm32 if insn.op1_kind() == OpKind::Memory => {
+            if insn.memory_index() != Register::None && insn.memory_index_scale() == 4 {
+                if let Some(bi) = gpr_index(insn.memory_base()) {
+                    if let Some(base_val) = reg_vals[bi] {
+                        let table_start = base_val.wrapping_add(insn.memory_displacement64());
+                        // Look up the CMP bound for the index register
+                        let max_entries = gpr_index(insn.memory_index())
+                            .and_then(|ii| cmp_bound[ii]);
+                        jt_info[di] = Some((table_start, base_val, max_entries));
+                        return;
+                    }
+                }
+            }
+            jt_info[di] = None;
+        }
+
+        // ADD r64, r64 — propagate jt_info through the base+offset addition.
+        // Verify that the other operand's reg_vals matches the target_base
+        // to avoid false positives from unrelated ADDs.
+        Code::Add_rm64_r64 | Code::Add_r64_rm64
+            if insn.op0_kind() == OpKind::Register
+                && insn.op1_kind() == OpKind::Register =>
+        {
+            let src = insn.op1_register();
+            if let Some(si) = gpr_index(src) {
+                if let Some((_, target_base, _)) = jt_info[di] {
+                    // dst had the table offset; verify src is the base register
+                    if reg_vals[si] == Some(target_base) {
+                        // jt_info[di] stays — dst is now offset + base = target
+                    } else {
+                        jt_info[di] = None;
+                    }
+                } else if let Some(info) = jt_info[si] {
+                    // src had the table offset; verify dst is the base register
+                    let (_, target_base, _) = info;
+                    if reg_vals[di] == Some(target_base) {
+                        jt_info[di] = Some(info);
+                    } else {
+                        jt_info[di] = None;
+                    }
+                } else {
+                    jt_info[di] = None;
+                }
+            } else {
+                jt_info[di] = None;
+            }
+        }
+
+        // Everything else that writes to a register: clear jt_info
+        _ => {
+            jt_info[di] = None;
+        }
+    }
+}
+
+/// Track CMP immediate bounds per register and propagate through MOV.
+///
+/// When `CMP rN, imm` is seen, records `imm + 1` as the maximum number of
+/// valid jump table entries (valid indices are 0..imm). Propagated through
+/// register-to-register MOV (handles `mov eax, ebx` preserving the bound).
+/// Cleared by any other register write.
+fn update_cmp_state(insn: &Instruction, cmp_bound: &mut [Option<u32>; 16]) {
+    // CMP rN, imm → set bound
+    match insn.code() {
+        Code::Cmp_rm64_imm32
+        | Code::Cmp_rm32_imm32
+        | Code::Cmp_RAX_imm32
+        | Code::Cmp_EAX_imm32 => {
+            if insn.op0_kind() == OpKind::Register {
+                if let Some(ri) = gpr_index(insn.op0_register()) {
+                    let imm = insn.immediate32() as u64;
+                    if imm < MAX_JUMP_TABLE_ENTRIES as u64 {
+                        cmp_bound[ri] = Some((imm + 1) as u32);
+                    } else {
+                        cmp_bound[ri] = None;
+                    }
+                    return;
+                }
+            }
+        }
+        Code::Cmp_rm64_imm8 | Code::Cmp_rm32_imm8 => {
+            if insn.op0_kind() == OpKind::Register {
+                if let Some(ri) = gpr_index(insn.op0_register()) {
+                    let imm = insn.immediate8() as u64;
+                    if imm < MAX_JUMP_TABLE_ENTRIES as u64 {
+                        cmp_bound[ri] = Some((imm + 1) as u32);
+                    } else {
+                        cmp_bound[ri] = None;
+                    }
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Propagate through register-to-register MOV
+    let is_mov_reg = matches!(
+        insn.code(),
+        Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64
+    );
+    if is_mov_reg
+        && insn.op0_kind() == OpKind::Register
+        && insn.op1_kind() == OpKind::Register
+    {
+        if let (Some(di), Some(si)) =
+            (gpr_index(insn.op0_register()), gpr_index(insn.op1_register()))
+        {
+            cmp_bound[di] = cmp_bound[si];
+            return;
+        }
+    }
+
+    // Any other write to a register: clear bound
+    if insn.op_count() > 0 && insn.op0_kind() == OpKind::Register {
+        if let Some(di) = gpr_index(insn.op0_register()) {
+            cmp_bound[di] = None;
+        }
+    }
+}
+
+/// Fallback table size limit when no CMP bound is available.
+/// Must be very small — without a known bound, random data in large code
+/// segments can produce many false-positive targets.
+const FALLBACK_TABLE_LIMIT: usize = 0;
+
+/// Read a jump table starting at `table_start`, emitting Jump xrefs from
+/// `jmp_va` to each resolved target.
+///
+/// Each entry is a signed 32-bit offset added to `target_base` to compute
+/// the jump target.
+///
+/// Guards against false positives from dead-code zones:
+///   - When a CMP bound is available, the table size is known precisely and
+///     the table is trusted (may reside in any segment, including .text for PE).
+///   - When no CMP bound is known, the table must reside in a non-exec segment
+///     (.rodata) to prevent random bytes in dead code from producing fake tables,
+///     and the size is capped at a small fallback.
+///   - Always stops on the first entry that doesn't resolve to an exec address.
+fn recover_jump_table(
+    jmp_va: u64,
+    table_start: u64,
+    target_base: u64,
+    max_entries: Option<u32>,
+    data_idx: &SegmentDataIndex,
+    seg_idx: &SegmentIndex,
+    xrefs: &mut Vec<Xref>,
+) {
+    let limit = match max_entries {
+        Some(n) => (n as usize).min(MAX_JUMP_TABLE_ENTRIES),
+        None => {
+            // Without a CMP bound, require data in a non-exec segment.
+            // Dead-code LEA+MOVSXD+ADD+JMP patterns in .text would reference
+            // .text data that looks like valid offsets, producing many FPs.
+            let flags = data_idx.flags_at(Va(table_start));
+            if flags.is_none_or(|f| f & super::FLAG_EXEC != 0) {
+                return;
+            }
+            FALLBACK_TABLE_LIMIT
+        }
+    };
+    for i in 0..limit {
+        let slot_va = table_start.wrapping_add((i as u64) * 4);
+        let Some(offset) = data_idx.read_i32_at(Va(slot_va)) else {
+            break;
+        };
+        let target = (target_base as i64).wrapping_add(offset as i64) as u64;
+        if !seg_idx.is_exec(Va(target)) {
+            break;
+        }
+        xrefs.push(Xref {
+            from: Va(jmp_va),
+            to: Va(target),
+            kind: XrefKind::Jump,
+            confidence: Confidence::LocalProp,
+        });
+    }
+}
+
 /// Extract the direct branch/call target if the instruction has one.
 fn direct_target(insn: &Instruction) -> Option<u64> {
     // iced-x86 provides NearBranch64 for direct calls/jumps
@@ -437,6 +688,19 @@ mod tests {
         }
     }
 
+    fn fake_data_seg(va: u64, data: &'static [u8]) -> Segment {
+        Segment {
+            va: Va(va),
+            data,
+            executable: false,
+            readable: true,
+            writable: false,
+            byte_scannable: false,
+            mode: DecodeMode::Default,
+            name: "test_data".to_string(),
+        }
+    }
+
     fn region_for<'a>(seg: &'a Segment) -> ScanRegion<'a> {
         ScanRegion::new(seg, seg.va, seg.va + seg.data.len() as u64)
     }
@@ -453,7 +717,8 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
+        let data_idx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].from, Va(0x1000));
         assert_eq!(xrefs[0].to, Va(0x2000));
@@ -476,7 +741,8 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
+        let data_idx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
         let jmp = xrefs.iter().find(|x| x.kind == XrefKind::Jump).unwrap();
         assert_eq!(jmp.from, Va(0x1005));
         assert_eq!(jmp.to, Va(0x2000));
@@ -498,7 +764,8 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
+        let data_idx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
         let je = xrefs.iter().find(|x| x.kind == XrefKind::CondJump).unwrap();
         assert_eq!(je.from, Va(0x100a));
         assert_eq!(je.to, Va(0x2000));
@@ -517,7 +784,8 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
+        let data_idx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
         // LEA = takes address → DataPointer (IDA dr_O), not DataRead
         let lea = xrefs
             .iter()
@@ -544,7 +812,8 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_with_prop(&region_for(&code), &idx, &HashSet::new());
+        let data_idx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_with_prop(&region_for(&code), &idx, &HashSet::new(), &data_idx);
         let prop = xrefs
             .iter()
             .find(|x| x.confidence == Confidence::LocalProp)
@@ -563,7 +832,138 @@ mod tests {
         let code = fake_seg(0x1000, &CODE);
         let segs = vec![fake_seg(0x1000, &CODE)];
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
+        let data_idx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
         assert!(xrefs.is_empty());
+    }
+
+    // ── Jump table recovery ───────────────────────────────────────────────────
+
+    /// CMP + JA + LEA + MOVSXD + ADD + JMP rax — full jump table pattern.
+    /// Table at 0x3000 with two i32 offsets pointing to targets at 0x2000, 0x2004.
+    #[test]
+    fn test_jump_table_basic() {
+        // Code at 0x1000:
+        //   0x1000: 83 FA 01                 cmp edx, 1          (bound = 2 entries)
+        //   0x1003: 77 11                    ja  0x1016          (skip if > 1)
+        //   0x1005: 48 8D 0D F4 1F 00 00    lea rcx, [rip+0x1FF4]  → 0x3000
+        //   0x100C: 48 63 04 91              movsxd rax, [rcx+rdx*4]
+        //   0x1010: 48 01 C8                 add rax, rcx
+        //   0x1013: FF E0                    jmp rax
+        //   0x1015: CC                       int3 (padding)
+        //   0x1016: CC                       int3 (JA target)
+        static CODE: [u8; 23] = [
+            0x83, 0xFA, 0x01,                           // cmp edx, 1
+            0x77, 0x11,                                 // ja +0x11 (→ 0x1016)
+            0x48, 0x8D, 0x0D, 0xF4, 0x1F, 0x00, 0x00, // lea rcx, [rip+0x1FF4]
+            0x48, 0x63, 0x04, 0x91,                     // movsxd rax, [rcx+rdx*4]
+            0x48, 0x01, 0xC8,                           // add rax, rcx
+            0xFF, 0xE0,                                 // jmp rax
+            0xCC,                                       // int3
+            0xCC,                                       // int3 (JA target)
+        ];
+        // Table at 0x3000: two i32 offsets → targets at 0x2000, 0x2004
+        //   entry 0: 0x2000 - 0x3000 = -0x1000 = 0xFFFFF000
+        //   entry 1: 0x2004 - 0x3000 = -0x0FFC = 0xFFFFF004
+        static TABLE: [u8; 8] = [
+            0x00, 0xF0, 0xFF, 0xFF, // -0x1000
+            0x04, 0xF0, 0xFF, 0xFF, // -0x0FFC
+        ];
+        // Target code segment at 0x2000 (executable)
+        static TARGETS: [u8; 8] = [0xCC; 8]; // INT3 placeholders
+
+        let code_seg = fake_seg(0x1000, &CODE);
+        let segs = vec![
+            fake_seg(0x1000, &CODE),
+            fake_seg(0x2000, &TARGETS),
+            fake_data_seg(0x3000, &TABLE),
+        ];
+
+        let idx = SegmentIndex::build(&segs);
+        let data_idx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_with_prop(&region_for(&code_seg), &idx, &HashSet::new(), &data_idx);
+
+        // Should have Jump xrefs from 0x1013 to 0x2000 and 0x2004
+        let jumps: Vec<&Xref> = xrefs
+            .iter()
+            .filter(|x| x.kind == XrefKind::Jump && x.confidence == Confidence::LocalProp)
+            .collect();
+        assert_eq!(jumps.len(), 2, "expected 2 jump table targets, got {}", jumps.len());
+        assert!(jumps.iter().any(|x| x.from == Va(0x1013) && x.to == Va(0x2000)));
+        assert!(jumps.iter().any(|x| x.from == Va(0x1013) && x.to == Va(0x2004)));
+    }
+
+    /// Jump table with forward offsets (positive i32 values) and CMP bound.
+    #[test]
+    fn test_jump_table_forward_offsets() {
+        // Table at 0x3000, targets at 0x4000 and 0x4100 (forward from table)
+        //   entry 0: 0x4000 - 0x3000 = +0x1000
+        //   entry 1: 0x4100 - 0x3000 = +0x1100
+        static CODE: [u8; 23] = [
+            0x83, 0xFA, 0x01,                           // cmp edx, 1
+            0x77, 0x11,                                 // ja +0x11
+            0x48, 0x8D, 0x0D, 0xF4, 0x1F, 0x00, 0x00, // lea rcx, [rip+0x1FF4] → 0x3000
+            0x48, 0x63, 0x04, 0x91,                     // movsxd rax, [rcx+rdx*4]
+            0x48, 0x01, 0xC8,                           // add rax, rcx
+            0xFF, 0xE0,                                 // jmp rax
+            0xCC,                                       // int3
+            0xCC,                                       // int3
+        ];
+        static TABLE: [u8; 8] = [
+            0x00, 0x10, 0x00, 0x00, // +0x1000
+            0x00, 0x11, 0x00, 0x00, // +0x1100
+        ];
+        static TARGETS: [u8; 0x200] = [0xCC; 0x200];
+
+        let code_seg = fake_seg(0x1000, &CODE);
+        let segs = vec![
+            fake_seg(0x1000, &CODE),
+            fake_data_seg(0x3000, &TABLE),
+            fake_seg(0x4000, &TARGETS),
+        ];
+
+        let idx = SegmentIndex::build(&segs);
+        let data_idx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_with_prop(&region_for(&code_seg), &idx, &HashSet::new(), &data_idx);
+
+        let jumps: Vec<&Xref> = xrefs
+            .iter()
+            .filter(|x| x.kind == XrefKind::Jump && x.confidence == Confidence::LocalProp)
+            .collect();
+        assert_eq!(jumps.len(), 2);
+        assert!(jumps.iter().any(|x| x.from == Va(0x1013) && x.to == Va(0x4000)));
+        assert!(jumps.iter().any(|x| x.from == Va(0x1013) && x.to == Va(0x4100)));
+    }
+
+    /// No jump xrefs when table entries don't resolve to executable addresses.
+    #[test]
+    fn test_jump_table_no_valid_targets() {
+        static CODE: [u8; 16] = [
+            0x48, 0x8D, 0x0D, 0xF9, 0x1F, 0x00, 0x00,
+            0x48, 0x63, 0x04, 0x91,
+            0x48, 0x01, 0xC8,
+            0xFF, 0xE0,
+        ];
+        // Table offsets point to unmapped addresses (no target segment)
+        static TABLE: [u8; 8] = [
+            0x00, 0x00, 0x10, 0x00, // +0x100000 → 0x103000 (unmapped)
+            0x00, 0x00, 0x20, 0x00, // +0x200000 → 0x203000 (unmapped)
+        ];
+
+        let code_seg = fake_seg(0x1000, &CODE);
+        let segs = vec![
+            fake_seg(0x1000, &CODE),
+            fake_data_seg(0x3000, &TABLE),
+        ];
+
+        let idx = SegmentIndex::build(&segs);
+        let data_idx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_with_prop(&region_for(&code_seg), &idx, &HashSet::new(), &data_idx);
+
+        let jumps: Vec<&Xref> = xrefs
+            .iter()
+            .filter(|x| x.kind == XrefKind::Jump && x.confidence == Confidence::LocalProp)
+            .collect();
+        assert!(jumps.is_empty(), "should emit no jump table xrefs for unmapped targets");
     }
 }

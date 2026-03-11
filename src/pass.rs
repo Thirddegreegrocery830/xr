@@ -475,10 +475,10 @@ fn scan_shard(
         }
         // x86-64
         (Arch::X86_64, _, Depth::Linear) => {
-            x86_64::scan_linear(&region, ctx.seg_idx, ctx.got_slots)
+            x86_64::scan_linear(&region, ctx.seg_idx, ctx.got_slots, ctx.data_idx)
         }
         (Arch::X86_64, _, Depth::Paired) => {
-            x86_64::scan_with_prop(&region, ctx.seg_idx, ctx.got_slots)
+            x86_64::scan_with_prop(&region, ctx.seg_idx, ctx.got_slots, ctx.data_idx)
         }
         // x86 32-bit — stub
         (Arch::X86, _, _) => {

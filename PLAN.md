@@ -356,7 +356,7 @@ from local analysis of the instruction sequence, not from a full CFG.
 
 1. ~~**GOT fix** — pure bugfix, highest F1 impact per line of code changed~~ ✅ DONE
 2. ~~**Reloc data_ptr** — biggest FN category (75%), moderate implementation effort~~ ✅ DONE (ELF + PE)
-3. **Jump tables** — meaningful FN reduction, most implementation effort
+3. ~~**Jump tables** — meaningful FN reduction, most implementation effort~~ ✅ DONE (x86-64)
 
 ---
 
@@ -411,3 +411,53 @@ Overall F1 improvements on 10+ binaries. No regressions on any binary.
 PE reloc parsing adds modest improvements (3114 entries on dwritemin.dll).
 Statically linked binaries (curl-amd64, curl-aarch64) unaffected.
 Mach-O fixup chains not yet implemented (692 FNs on hello.aarch64-apple-darwin).
+
+---
+
+## Results after workstream 3 (x86-64 jump table recovery)
+
+Implementation: added jump table recovery to `scan_with_prop` in
+`src/arch/x86_64.rs`. Recognises the compiler pattern:
+  CMP ridx, IMM → JA default → LEA rbase, [rip+table] →
+  MOVSXD roff, [rbase+ridx*4] → ADD rtgt, rbase → JMP rtgt
+
+Three tracking arrays in the forward scan:
+- `reg_vals[16]`: known constant register values (pre-existing)
+- `jt_info[16]`: (table_start, target_base, max_entries) from MOVSXD+ADD
+- `cmp_bound[16]`: CMP immediate bounds per register, propagated through MOV
+
+`recover_jump_table()` reads i32 offsets from the table, computes
+`target = target_base + offset`, emits Jump xrefs. Guarded by:
+- CMP bound from `cmp_bound[index_reg]` when available (precise table size)
+- Without CMP bound: requires table in non-exec segment + small fallback limit
+- Stops on first entry not resolving to an executable address
+- ADD verification: checks reg_vals match the original table base
+
+Also added `read_i32_at()` to `SegmentDataIndex` for table entry reads.
+
+Key results (Paired depth, jump metrics, before → after):
+
+| Binary                         | jump FN before | jump FN after | jump F1 before | jump F1 after |
+|--------------------------------|----------------|---------------|----------------|---------------|
+| curl-amd64                     | 3448           | 403           | 0.958          | 0.972         |
+| blackcat.elf                   | 2727           | 2369          | 0.966          | 0.969         |
+| hello-linux-gcc                | ~500           | 273           | ~0.93          | 0.985         |
+| hello.x86_64-pc-windows-gnu.exe| ~1000          | 541           | ~0.93          | 0.987         |
+| libharlem-shake.so             | 756            | 413           | 0.976          | 0.987         |
+| libssl3-amd64.so.3             | ~500           | 273           | ~0.97          | 0.985         |
+| dwritemin.dll                  | ~800           | 458           | ~0.97          | 0.992         |
+| sudo.exe                       | ~1500          | 1242          | ~0.90          | 0.967         |
+
+Overall F1 improvements (selected binaries):
+
+| Binary                         | overall F1 before | overall F1 after | Δ      |
+|--------------------------------|-------------------|------------------|--------|
+| curl-amd64                     | 0.961             | 0.969            | +0.008 |
+| hello.x86_64-pc-windows-gnu.exe| 0.852             | 0.878            | +0.026 |
+| hello-linux-gcc                | 0.897             | 0.914            | +0.017 |
+| libssl3-amd64.so.3             | 0.916             | 0.925            | +0.009 |
+| libharlem-shake.so             | 0.861             | 0.867            | +0.006 |
+| blackcat.elf                   | 0.952             | 0.954            | +0.002 |
+
+No regressions on any of the 19 test binaries.
+ARM64 binaries unaffected (ARM64 jump table recovery not yet implemented).
