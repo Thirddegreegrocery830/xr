@@ -246,6 +246,23 @@ impl<'a> SegmentDataIndex<'a> {
             bytes.try_into().expect("slice is exactly 4 bytes"),
         ))
     }
+
+    /// Read a single byte at the given VA, returning `None` if unmapped.
+    pub(crate) fn read_u8_at(&self, va: Va) -> Option<u8> {
+        let e = self.entry_at(va)?;
+        let offset = (va - e.start) as usize;
+        e.data.get(offset).copied()
+    }
+
+    /// Read a little-endian `u16` at the given VA, returning `None` if unmapped.
+    pub(crate) fn read_u16_at(&self, va: Va) -> Option<u16> {
+        let e = self.entry_at(va)?;
+        let offset = (va - e.start) as usize;
+        let bytes = e.data.get(offset..offset + 2)?;
+        Some(u16::from_le_bytes(
+            bytes.try_into().expect("slice is exactly 2 bytes"),
+        ))
+    }
 }
 
 /// Pointer-width byte scan over a data region.
