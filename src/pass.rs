@@ -190,7 +190,11 @@ impl<'a> XrefPass<'a> {
         // owned_end = next shard's start (or seg_end for the last shard).
         // scan_end includes the overlap lookahead; owned_end does not.
         // Using next shard's start directly handles overlap >= chunk correctly.
-        let code_shards: Vec<(&Segment, u64, u64, u64)> = self
+        let code_shards: Vec<(&Segment, u64, u64, u64)> = if depth == Depth::ByteScan {
+            // ByteScan is data-only — no instruction decoding.
+            vec![]
+        } else {
+        self
             .binary
             .code_segments()
             .flat_map(|seg| {
@@ -216,7 +220,8 @@ impl<'a> XrefPass<'a> {
                     })
                     .collect()
             })
-            .collect();
+            .collect()
+        };
 
         let data_shards: Vec<(&Segment, u64, u64)> = if depth >= Depth::ByteScan {
             self.binary
@@ -255,7 +260,6 @@ impl<'a> XrefPass<'a> {
         };
 
         let ctx = ScanCtx {
-            all_segs,
             seg_idx: &seg_idx,
             data_idx: &data_idx,
             got_map: &self.binary.got_map,
@@ -390,7 +394,6 @@ impl<'a> XrefPass<'a> {
 /// Bundles the two indices so `scan_shard` stays under the clippy
 /// `too_many_arguments` limit (7).
 struct ScanCtx<'a> {
-    all_segs: &'a [Segment],
     seg_idx: &'a SegmentIndex,
     data_idx: &'a SegmentDataIndex,
     /// GOT slot VA → extern VA (from `LoadedBinary::got_map`).
@@ -410,12 +413,10 @@ fn scan_shard(
     match (arch, seg.mode, depth) {
         // ARM64 — always Default mode at this point (Thumb handled separately)
         (Arch::Arm64, DecodeMode::Default, Depth::Linear) => {
-            arm64::scan_linear(&region, ctx.all_segs, ctx.seg_idx, ctx.data_idx)
+            arm64::scan_linear(&region, ctx.seg_idx, ctx.data_idx)
         }
-        (Arch::Arm64, DecodeMode::Default, Depth::Paired)
-        | (Arch::Arm64, DecodeMode::Default, Depth::ByteScan) => {
-            // ByteScan on code segs still does linear (data scan handled separately)
-            arm64::scan_adrp(&region, ctx.all_segs, ctx.seg_idx, ctx.data_idx)
+        (Arch::Arm64, DecodeMode::Default, Depth::Paired) => {
+            arm64::scan_adrp(&region, ctx.seg_idx, ctx.data_idx)
         }
         // ARM32 / Thumb — stub for now
         (Arch::Arm32, _, _)
@@ -424,27 +425,19 @@ fn scan_shard(
             vec![] // TODO: arm32 pass
         }
         // x86-64
-        (Arch::X86_64, _, Depth::Linear) | (Arch::X86_64, _, Depth::ByteScan) => {
-            x86_64::scan_linear(
-                &region,
-                ctx.all_segs,
-                ctx.seg_idx,
-                ctx.data_idx,
-                ctx.got_map,
-            )
+        (Arch::X86_64, _, Depth::Linear) => {
+            x86_64::scan_linear(&region, ctx.seg_idx, ctx.data_idx, ctx.got_map)
         }
-        (Arch::X86_64, _, Depth::Paired) => x86_64::scan_with_prop(
-            &region,
-            ctx.all_segs,
-            ctx.seg_idx,
-            ctx.data_idx,
-            ctx.got_map,
-        ),
+        (Arch::X86_64, _, Depth::Paired) => {
+            x86_64::scan_with_prop(&region, ctx.seg_idx, ctx.data_idx, ctx.got_map)
+        }
         // x86 32-bit — stub
         (Arch::X86, _, _) => {
             vec![] // TODO: x86 32-bit pass
         }
         (Arch::Unknown, _, _) => vec![],
+        // ByteScan never generates code shards — these arms are unreachable.
+        (_, _, Depth::ByteScan) => unreachable!("ByteScan does not scan code segments"),
     }
 }
 

@@ -19,8 +19,8 @@
 //! | ADRP         | 9F00_0000    | 9000_0000    |
 //! | ADR          | 9F00_0000    | 1000_0000    |
 //! | ADD imm      | 7F80_0000    | 1100_0000    | (sf=0 or 1, op=0, S=0, shift=00/01)
-//! | LDR (unsigned)| BFC0_0000   | B940_0000    | (64-bit, unsigned offset)
-//! | STR (unsigned)| BFC0_0000   | F900_0000    | (64-bit, unsigned offset)
+//! | LDR (unsigned)| FFC0_0000   | F940_0000    | (64-bit, unsigned offset)
+//! | STR (unsigned)| FFC0_0000   | F900_0000    | (64-bit, unsigned offset)
 //! | BLR          | FFFF_FC1F    | D63F_0000    |
 //! | BR           | FFFF_FC1F    | D61F_0000    |
 

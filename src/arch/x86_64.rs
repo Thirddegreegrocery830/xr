@@ -11,7 +11,6 @@
 //! This catches `mov rax, imm64; call rax` patterns.
 
 use super::{ScanRegion, SegmentDataIndex, SegmentIndex, XrefSet};
-use crate::loader::Segment;
 use crate::xref::{Confidence, Xref, XrefKind};
 use iced_x86::{
     Code, Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, OpAccess,
@@ -38,7 +37,6 @@ fn mem_op_is_write(
 /// Depth 1: linear decode, immediate + RIP-relative targets.
 pub(crate) fn scan_linear(
     region: &ScanRegion,
-    _segments: &[Segment],
     idx: &SegmentIndex,
     _data_idx: &SegmentDataIndex,
     got_map: &HashMap<u64, u64>,
@@ -116,7 +114,6 @@ fn scan_linear_with_index(
 /// Catches `mov rax, imm64 / call rax` and similar patterns.
 pub(crate) fn scan_with_prop(
     region: &ScanRegion,
-    _segments: &[Segment],
     idx: &SegmentIndex,
     _data_idx: &SegmentDataIndex,
     got_map: &HashMap<u64, u64>,
@@ -454,16 +451,20 @@ fn update_prop_state(insn: &Instruction, vals: &mut [Option<u64>; 16]) {
         return;
     };
 
-    // MOV r64, imm64 — set the value
+    // MOV rN, imm — set the value
     match insn.code() {
-        Code::Mov_r64_imm64 | Code::Mov_r32_imm32 | Code::Mov_r16_imm16 => {
-            if insn.op1_kind() == OpKind::Immediate64 {
-                vals[dst_idx] = Some(insn.immediate64());
-            } else if insn.op1_kind() == OpKind::Immediate32to64 {
-                vals[dst_idx] = Some(insn.immediate32to64() as u64);
-            } else {
-                vals[dst_idx] = None;
-            }
+        Code::Mov_r64_imm64 => {
+            vals[dst_idx] = Some(insn.immediate64());
+        }
+        Code::Mov_rm64_imm32 => {
+            vals[dst_idx] = Some(insn.immediate32to64() as u64);
+        }
+        Code::Mov_r32_imm32 => {
+            // mov r32, imm32 zero-extends to 64 bits on x86-64
+            vals[dst_idx] = Some(insn.immediate32() as u64);
+        }
+        Code::Mov_r16_imm16 => {
+            vals[dst_idx] = Some(insn.immediate16() as u64);
         }
         // LEA r64, [rip+disp] — we know the value since RIP-relative is resolved
         Code::Lea_r64_m => {
@@ -542,7 +543,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &segs, &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].from, 0x1000);
         assert_eq!(xrefs[0].to, 0x2000);
@@ -566,7 +567,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &segs, &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
         let jmp = xrefs.iter().find(|x| x.kind == XrefKind::Jump).unwrap();
         assert_eq!(jmp.from, 0x1005);
         assert_eq!(jmp.to, 0x2000);
@@ -589,7 +590,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &segs, &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
         let je = xrefs.iter().find(|x| x.kind == XrefKind::CondJump).unwrap();
         assert_eq!(je.from, 0x100a);
         assert_eq!(je.to, 0x2000);
@@ -609,7 +610,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &segs, &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
         // LEA = takes address → DataPointer (IDA dr_O), not DataRead
         let lea = xrefs
             .iter()
@@ -637,7 +638,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_with_prop(&region_for(&code), &segs, &idx, &didx, &HashMap::new());
+        let xrefs = scan_with_prop(&region_for(&code), &idx, &didx, &HashMap::new());
         let prop = xrefs
             .iter()
             .find(|x| x.confidence == Confidence::LocalProp)
@@ -657,7 +658,7 @@ mod tests {
         let segs = vec![code.clone()];
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &segs, &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
         assert!(xrefs.is_empty());
     }
 }

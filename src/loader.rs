@@ -132,20 +132,20 @@ impl LoadedBinary {
         // Detect dyld shared cache by magic prefix before handing off to goblin.
         // The magic is "dyld_v1 " followed by the arch name (e.g. "arm64e", "x86_64h").
         if mmap.starts_with(b"dyld_v1 ") {
-            let (arch, segments, entry_points, symbols, pie_base, got_map, dyld_ctx) =
-                parse_dyld_cache(path)?;
+            let result = parse_dyld_cache(path)?;
+            let p = result.parsed;
             // Segment slices are zero-copy into dyld_ctx's mmaps.
             // dyld_ctx is stored here and dropped after segments (field order).
             return Ok(LoadedBinary {
-                arch,
-                segments,
-                entry_points,
-                symbols,
-                pie_base,
-                got_map,
+                arch: p.arch,
+                segments: p.segments,
+                entry_points: p.entry_points,
+                symbols: p.symbols,
+                pie_base: p.pie_base,
+                got_map: p.got_map,
                 _mmap: mmap,
                 _bss_bufs: vec![],
-                _dyld_ctx: Some(Box::new(dyld_ctx)),
+                _dyld_ctx: Some(Box::new(result.dyld_ctx)),
             });
         }
 
@@ -156,16 +156,15 @@ impl LoadedBinary {
         let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(mmap.as_ptr(), mmap.len()) };
 
         let mut bss_bufs: Vec<Box<[u8]>> = Vec::new();
-        let (arch, segments, entry_points, symbols, pie_base, got_map) =
-            parse_binary(bytes, &mut bss_bufs, base)?;
+        let p = parse_binary(bytes, &mut bss_bufs, base)?;
 
         Ok(LoadedBinary {
-            arch,
-            segments,
-            entry_points,
-            symbols,
-            pie_base,
-            got_map,
+            arch: p.arch,
+            segments: p.segments,
+            entry_points: p.entry_points,
+            symbols: p.symbols,
+            pie_base: p.pie_base,
+            got_map: p.got_map,
             _mmap: mmap,
             _bss_bufs: bss_bufs,
             _dyld_ctx: None,
@@ -237,17 +236,18 @@ impl LoadedBinary {
 }
 
 /// Return type shared by all binary-format parsers.
-/// Tuple: (arch, segments, entry_points, symbols, pie_base, got_map).
-/// pie_base is non-zero only for PIE ELF binaries rebased by parse_elf.
-/// got_map is populated by build_elf_got_map for PIE ELF; empty for other formats.
-type ParseResult = Result<(
-    Arch,
-    Vec<Segment>,
-    Vec<u64>,
-    Vec<(String, u64)>,
-    u64,
-    HashMap<u64, u64>,
-)>;
+/// Result of parsing a binary format (ELF, Mach-O, PE).
+struct ParseResult {
+    arch: Arch,
+    segments: Vec<Segment>,
+    entry_points: Vec<u64>,
+    symbols: Vec<(String, u64)>,
+    /// Non-zero only for PIE ELF binaries rebased by `parse_elf`.
+    pie_base: u64,
+    /// GOT slot VA → extern VA. Populated by `build_elf_got_map` for PIE ELF;
+    /// empty for other formats.
+    got_map: HashMap<u64, u64>,
+}
 
 /// Allocate a zero-filled buffer of `size` bytes, store it in `bufs` for
 /// lifetime management, and return a `&'static [u8]` into it.
@@ -269,7 +269,7 @@ fn parse_binary(
     bytes: &'static [u8],
     bss_bufs: &mut Vec<Box<[u8]>>,
     base: Option<u64>,
-) -> ParseResult {
+) -> Result<ParseResult> {
     match Object::parse(bytes)? {
         Object::Elf(elf) => parse_elf(bytes, &elf, bss_bufs, base),
         Object::Mach(goblin::mach::Mach::Binary(macho)) => parse_macho(bytes, &macho, bss_bufs),
@@ -289,7 +289,14 @@ fn parse_binary(
                 name: "raw".to_string(),
                 byte_scannable: true,
             };
-            Ok((Arch::Unknown, vec![seg], vec![0], vec![], 0, HashMap::new()))
+            Ok(ParseResult {
+                arch: Arch::Unknown,
+                segments: vec![seg],
+                entry_points: vec![0],
+                symbols: vec![],
+                pie_base: 0,
+                got_map: HashMap::new(),
+            })
         }
         _ => Err(anyhow!("unsupported binary format")),
     }
@@ -299,17 +306,12 @@ fn parse_binary(
 
 /// Extended return type for dyld cache: includes the DyldContext so the caller
 /// can store it and keep the mmaps alive for the lifetime of the segments.
-type DyldParseResult = Result<(
-    Arch,
-    Vec<Segment>,
-    Vec<u64>,
-    Vec<(String, u64)>,
-    u64,
-    HashMap<u64, u64>,
-    DyldContext,
-)>;
+struct DyldParseResult {
+    parsed: ParseResult,
+    dyld_ctx: DyldContext,
+}
 
-fn parse_dyld_cache(path: &Path) -> DyldParseResult {
+fn parse_dyld_cache(path: &Path) -> Result<DyldParseResult> {
     let ctx =
         DyldContext::open(path).map_err(|e| anyhow!("failed to open dyld shared cache: {e}"))?;
 
@@ -369,7 +371,17 @@ fn parse_dyld_cache(path: &Path) -> DyldParseResult {
         return Err(anyhow!("dyld shared cache: no usable mappings found"));
     }
 
-    Ok((arch, segments, vec![], vec![], 0, HashMap::new(), ctx))
+    Ok(DyldParseResult {
+        parsed: ParseResult {
+            arch,
+            segments,
+            entry_points: vec![],
+            symbols: vec![],
+            pie_base: 0,
+            got_map: HashMap::new(),
+        },
+        dyld_ctx: ctx,
+    })
 }
 
 fn parse_elf(
@@ -377,7 +389,7 @@ fn parse_elf(
     elf: &goblin::elf::Elf,
     bss_bufs: &mut Vec<Box<[u8]>>,
     base_override: Option<u64>,
-) -> ParseResult {
+) -> Result<ParseResult> {
     let arch = match elf.header.e_machine {
         goblin::elf::header::EM_X86_64 => Arch::X86_64,
         goblin::elf::header::EM_AARCH64 => Arch::Arm64,
@@ -638,7 +650,7 @@ fn parse_elf(
     //   Map: got_slot_va = r_offset+pie_base → extern_va for each GLOB_DAT/JUMP_SLOT reloc
     let got_map = build_elf_got_map(elf, pie_base);
 
-    Ok((arch, segments, entry_points, symbols, pie_base, got_map))
+    Ok(ParseResult { arch, segments, entry_points, symbols, pie_base, got_map })
 }
 
 /// Build the GOT slot → extern VA mapping for an ELF binary.
@@ -757,7 +769,7 @@ fn parse_macho(
     bytes: &'static [u8],
     macho: &goblin::mach::MachO,
     bss_bufs: &mut Vec<Box<[u8]>>,
-) -> ParseResult {
+) -> Result<ParseResult> {
     use goblin::mach::constants::cputype::*;
     let arch = match macho.header.cputype() {
         CPU_TYPE_X86_64 => Arch::X86_64,
@@ -795,7 +807,7 @@ fn parse_macho(
     for seg in macho.segments.iter() {
         let seg_name = seg.name().unwrap_or("?").to_string();
         // Each Mach-O section within the segment
-        for section in seg.sections().map_err(|e| anyhow::anyhow!("{e:?}"))? {
+        for section in seg.sections().map_err(|e| anyhow::anyhow!("{e}"))? {
             let (sect, data) = section;
             let sect_name = sect.name().unwrap_or("?").to_string();
             let size = sect.size as usize;
@@ -846,14 +858,21 @@ fn parse_macho(
         }
     }
 
-    Ok((arch, segments, entry_points, symbols, 0, HashMap::new()))
+    Ok(ParseResult {
+        arch,
+        segments,
+        entry_points,
+        symbols,
+        pie_base: 0,
+        got_map: HashMap::new(),
+    })
 }
 
 fn parse_pe(
     bytes: &'static [u8],
     pe: &goblin::pe::PE,
     bss_bufs: &mut Vec<Box<[u8]>>,
-) -> ParseResult {
+) -> Result<ParseResult> {
     use goblin::pe::header::*;
 
     let arch = match pe.header.coff_header.machine {
@@ -971,7 +990,14 @@ fn parse_pe(
         }
     }
 
-    Ok((arch, segments, entry_points, symbols, 0, HashMap::new()))
+    Ok(ParseResult {
+        arch,
+        segments,
+        entry_points,
+        symbols,
+        pie_base: 0,
+        got_map: HashMap::new(),
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

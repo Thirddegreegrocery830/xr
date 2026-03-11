@@ -10,7 +10,6 @@ use crate::xref::{Confidence, XrefKind};
 use serde::Serialize;
 use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -137,63 +136,24 @@ impl Printer for TextPrinter {
     }
 }
 
-// ── JSON printer ──────────────────────────────────────────────────────────────
+// ── JSONL printer ─────────────────────────────────────────────────────────────
 
-/// JSON array printer.
+/// JSON Lines printer — one compact JSON object per line, no array wrapper.
 ///
-/// Records are separated by commas emitted as a *leading* separator (before the
-/// second and subsequent records) so that no trailing comma is appended after the
-/// last record.  The leading-comma approach is the only correct option given the
-/// `Printer` trait's stateless `write_record` design: `write_record` appends into
-/// a caller-supplied buffer and is called from parallel fold operations, so we
-/// cannot know at call-time whether a given record is the last one.
-///
-/// Instead we track "has any record been written yet?" with an `AtomicBool`.
-/// The first record emits no leading comma; all subsequent ones do.
-pub struct JsonPrinter {
-    /// Set to `true` after the first record is written.
-    first_done: AtomicBool,
-}
+/// Each record is serialised as a single line of JSON followed by `\n`.
+/// No commas, no `[`/`]` delimiters. This format is trivially parallel-safe:
+/// every `write_record` call is independent — no shared state needed.
+pub struct JsonlPrinter;
 
-impl JsonPrinter {
-    pub fn new() -> Self {
-        Self {
-            first_done: AtomicBool::new(false),
-        }
-    }
-}
-
-impl Default for JsonPrinter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Printer for JsonPrinter {
-    fn header_bytes(&self) -> Vec<u8> {
-        b"[\n".to_vec()
-    }
-
+impl Printer for JsonlPrinter {
     fn write_record(&self, r: &XrefRecord, buf: &mut Vec<u8>) {
-        match serde_json::to_string_pretty(r) {
+        match serde_json::to_string(r) {
             Ok(s) => {
-                // Emit a comma separator *before* the record — except for the
-                // very first record.  `swap` is a single atomic RMW: whichever
-                // thread wins the false→true transition emits no comma; all
-                // others emit one.
-                let need_comma = self.first_done.swap(true, Ordering::Relaxed);
-                if need_comma {
-                    buf.extend_from_slice(b",\n");
-                }
                 buf.extend_from_slice(s.as_bytes());
                 buf.push(b'\n');
             }
             Err(e) => eprintln!("json serialisation error: {e}"),
         }
-    }
-
-    fn footer_bytes(&self) -> Vec<u8> {
-        b"]\n".to_vec()
     }
 }
 

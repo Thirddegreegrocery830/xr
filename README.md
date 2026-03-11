@@ -13,8 +13,8 @@ cargo build --release
 # Analyse a binary at the recommended depth
 ./target/release/xr /path/to/binary --depth paired
 
-# Output as JSON or CSV
-./target/release/xr /path/to/binary --depth paired --format json
+# Output as JSONL or CSV
+./target/release/xr /path/to/binary --depth paired --format jsonl
 ./target/release/xr /path/to/binary --depth paired --format csv
 
 # Filter to a specific xref kind
@@ -65,7 +65,7 @@ USAGE:
 OPTIONS:
     -d, --depth <DEPTH>         Analysis depth: scan | linear | paired [default: paired]
     -j, --workers <N>           Worker threads; 0 = all CPUs [default: 0]
-    -f, --format <FORMAT>       Output format: text | json | csv [default: text]
+    -f, --format <FORMAT>       Output format: text | jsonl | csv [default: text]
     -k, --kind <KIND>           Filter by kind: call | jump | data_read | data_write | data_ptr
         --base <VA>             Override PIE ELF load base (hex or decimal)
         --min-ref-va <VA>       Drop xrefs whose 'to' VA is below this value

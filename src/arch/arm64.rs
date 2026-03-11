@@ -16,7 +16,6 @@
 
 use super::{ScanRegion, SegmentDataIndex, SegmentIndex, XrefSet};
 use crate::arch::arm64_decode::Arm64Insn;
-use crate::loader::Segment;
 use crate::xref::{Confidence, Xref, XrefKind};
 
 // How many instructions back we look for an ADRP that feeds the current insn.
@@ -28,7 +27,6 @@ const ADRP_WINDOW: usize = 8;
 /// No register tracking. Fast, no false positives on immediate targets.
 pub(crate) fn scan_linear(
     region: &ScanRegion,
-    _segments: &[Segment],
     idx: &SegmentIndex,
     _data_idx: &SegmentDataIndex,
 ) -> XrefSet {
@@ -59,7 +57,6 @@ pub(crate) fn scan_linear(
 /// Returns combined set — superset of depth 1.
 pub(crate) fn scan_adrp(
     region: &ScanRegion,
-    _segments: &[Segment],
     idx: &SegmentIndex,
     data_idx: &SegmentDataIndex,
 ) -> XrefSet {
@@ -492,7 +489,7 @@ mod tests {
         let region = region_for(&code_seg);
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region, &segs, &idx, &didx);
+        let xrefs = scan_linear(&region, &idx, &didx);
 
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].from, 0x1000);
@@ -515,7 +512,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code_seg), &segs, &idx, &didx);
+        let xrefs = scan_linear(&region_for(&code_seg), &idx, &didx);
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].from, 0x1008);
         assert_eq!(xrefs[0].to, 0x1010);
@@ -537,7 +534,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&seg), &segs, &idx, &didx);
+        let xrefs = scan_linear(&region_for(&seg), &idx, &didx);
         // CBZ at 0x1008 → target 0x1004
         let cbz_xref = xrefs.iter().find(|x| x.from == 0x1008).unwrap();
         assert_eq!(cbz_xref.to, 0x1004);
@@ -562,7 +559,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_adrp(&region_for(&code_seg), &segs, &idx, &didx);
+        let xrefs = scan_adrp(&region_for(&code_seg), &idx, &didx);
         let pair = xrefs
             .iter()
             .find(|x| x.confidence == Confidence::PairResolved)
@@ -584,7 +581,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code_seg), &segs, &idx, &didx);
+        let xrefs = scan_linear(&region_for(&code_seg), &idx, &didx);
         assert!(
             xrefs.is_empty(),
             "xref to unmapped target should be suppressed"

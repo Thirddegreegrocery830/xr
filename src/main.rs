@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use std::io::Write as _;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
-use xr::output::{ContextLine, CsvPrinter, JsonPrinter, Printer, TextPrinter, XrefRecord};
+use xr::output::{ContextLine, CsvPrinter, JsonlPrinter, Printer, TextPrinter, XrefRecord};
 use xr::{parse_va, Depth, LoadedBinary, PassConfig, XrefPass};
 
 #[derive(Parser)]
@@ -31,7 +31,7 @@ struct Cli {
     #[arg(short = 'j', long, default_value = "0")]
     workers: usize,
 
-    /// Output format
+    /// Output format (text, jsonl, csv)
     #[arg(short, long, default_value = "text")]
     format: OutputFormat,
 
@@ -91,7 +91,7 @@ enum DepthArg {
 #[derive(Clone, ValueEnum)]
 enum OutputFormat {
     Text,
-    Json,
+    Jsonl,
     Csv,
 }
 
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
 
     let printer: Box<dyn Printer> = match cli.format {
         OutputFormat::Text => Box::new(TextPrinter),
-        OutputFormat::Json => Box::new(JsonPrinter::new()),
+        OutputFormat::Jsonl => Box::new(JsonlPrinter),
         OutputFormat::Csv => Box::new(CsvPrinter),
     };
 
@@ -162,7 +162,7 @@ fn main() -> Result<()> {
 
     let hdr = printer.header_bytes();
     if !hdr.is_empty() {
-        let _ = stdout.write_all(&hdr);
+        stdout.write_all(&hdr)?;
     }
 
     let result = XrefPass::new(&binary, config).run(|batch| {
@@ -237,7 +237,9 @@ fn main() -> Result<()> {
 
         for chunk in candidates.chunks(CHUNK) {
             let blob = format_chunk(chunk);
-            let _ = stdout.write_all(&blob);
+            if stdout.write_all(&blob).is_err() {
+                return ControlFlow::Break(());
+            }
             emitted += chunk.len();
         }
 
@@ -250,9 +252,9 @@ fn main() -> Result<()> {
 
     let ftr = printer.footer_bytes();
     if !ftr.is_empty() {
-        let _ = stdout.write_all(&ftr);
+        stdout.write_all(&ftr)?;
     }
-    let _ = stdout.flush();
+    stdout.flush()?;
 
     result.print_summary();
 
