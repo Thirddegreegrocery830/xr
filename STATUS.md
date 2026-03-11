@@ -10,7 +10,7 @@ ground-truth xrefs. Maximise F1 score across all xref kinds.
 
 ## Current Scores (Paired depth, 14 workers)
 
-### curl-aarch64 (ARM64 ELF)
+### curl-aarch64 (ARM64 ELF, statically linked)
 
 | Kind       | TP    | FP   | FN    | Prec  | Rec   | F1    |
 |------------|-------|------|-------|-------|-------|-------|
@@ -21,7 +21,7 @@ ground-truth xrefs. Maximise F1 score across all xref kinds.
 | data_ptr   | 26122 | 1035 | 10900 | 0.962 | 0.706 | 0.814 |
 | **overall**|**159365**|**2687**|**16385**|**0.983**|**0.907**|**0.944**|
 
-### curl-amd64 (x86-64 ELF)
+### curl-amd64 (x86-64 ELF, statically linked)
 
 | Kind       | TP     | FP   | FN    | Prec  | Rec   | F1    |
 |------------|--------|------|-------|-------|-------|-------|
@@ -40,8 +40,8 @@ ground-truth xrefs. Maximise F1 score across all xref kinds.
 | jump       | 49671 | 795 |  2727 | 0.984 | 0.948 | 0.966 |
 | data_read  |  8750 |   2 |   494 | 1.000 | 0.947 | 0.972 |
 | data_write |   170 |   1 |    19 | 0.994 | 0.899 | 0.944 |
-| data_ptr   |  8535 |  12 |  5201 | 0.999 | 0.621 | 0.766 |
-| **overall**|**77316**|**881**|**9551**|**0.989**|**0.890**|**0.937**|
+| data_ptr   | 10864 |  12 |  2872 | 0.999 | 0.791 | 0.883 |
+| **overall**|**79645**|**881**|**7222**|**0.989**|**0.917**|**0.952**|
 
 ### libharlem-shake.so (x86-64 PIE ELF, external symbol calls)
 
@@ -50,8 +50,8 @@ ground-truth xrefs. Maximise F1 score across all xref kinds.
 | call       |  8235 | 456 |   711 | 0.948 | 0.921 | 0.934 |
 | jump       | 15169 |   5 |   756 | 1.000 | 0.953 | 0.976 |
 | data_read  |  6221 |   0 |    57 | 1.000 | 0.991 | 0.995 |
-| data_ptr   |  3797 |  15 |  9199 | 0.996 | 0.292 | 0.452 |
-| **overall**|**28622**|**17**|**10723**|**0.999**|**0.727**|**0.842**|
+| data_ptr   |  4936 |  15 |  8060 | 0.997 | 0.380 | 0.550 |
+| **overall**|**29761**|**17**|**9584**|**0.999**|**0.756**|**0.861**|
 
 ### libziggy.so (AArch64 PIE ELF)
 
@@ -59,17 +59,21 @@ ground-truth xrefs. Maximise F1 score across all xref kinds.
 |------------|------|----|------|-------|-------|-------|
 | call       | 1047 |  0 |    0 | 1.000 | 1.000 | 1.000 |
 | jump       | 2942 |  0 |  129 | 1.000 | 0.958 | 0.979 |
-| data_ptr   |  183 |  0 | 1758 | 1.000 | 0.094 | 0.172 |
-| **overall**|**4330**|**2**|**1956**|**1.000**|**0.689**|**0.816**|
+| data_ptr   |  365 |  0 | 1576 | 1.000 | 0.188 | 0.317 |
+| **overall**|**4512**|**2**|**1774**|**1.000**|**0.718**|**0.836**|
 
 ### Other test binaries (Paired depth)
 
 | Binary | Overall F1 |
 |--------|------------|
-| hello-linux-gcc (x86-64 PIE ELF) | 0.874 |
+| hello-linux-gcc (x86-64 PIE ELF) | 0.897 |
+| libssl3-amd64.so.3 (x86-64 ELF) | 0.916 |
+| libcurl-arm64.so (AArch64 ELF)   | 0.902 |
+| libcurl-x86.so (x86-64 ELF)     | 0.954 |
+| libpjsip-everything.so (x86-64)  | 0.910 |
 | hello.aarch64-apple-darwin (Mach-O) | 0.945 |
 | hello.x86_64-pc-windows-gnu.exe (PE) | 0.852 |
-| simple.exe (PE) | 0.724 |
+| simple.exe (PE) | 0.730 |
 
 ---
 
@@ -162,6 +166,8 @@ Each binary is split into `Segment` structs with:
 | Parse `.eh_frame_hdr` for x86-64 data_ptr | All 13595 `init_loc` entries point into `.text`, not `.rodata`. IDA records 0 xrefs FROM `.eh_frame_hdr`. The 3435 `.rodata` FNs are gcc_except_table LSDA (variable-length, not parseable simply). |
 | GOT extern VA algorithm (v1) | IDA's extern VA assignment order ≠ dynsym sequence order for many binaries. 0 mismatches on libharlem-shake.so but 5184 FP calls on blackcat.elf. Replaced by GOT slot VA approach. |
 | GOT slot VA approach (v2) | Emits to=got_slot_va instead of extern VA; benchmark normalizes IDA xrefs. blackcat.elf call F1 0.644→0.964, hello-linux-gcc call FPs 266→0. No regressions. |
+| ELF reloc data_ptr (R_*_RELATIVE, R_*_64) | Parses .rela.dyn for pointer pairs. blackcat.elf data_ptr F1 0.766→0.883, libssl3-amd64 0.511→0.732. +24k TPs across all ELF binaries. |
+| PE base reloc data_ptr (DIR64) | Parses .reloc section for pointer slots. Modest gains (3114 entries on dwritemin.dll). |
 
 ---
 
@@ -180,15 +186,16 @@ misidentified code or dead-code calls.
 **Fix approach**: PLT call resolution (resolving `E8 rel32` through PLT stub → extern
 symbol) would fix the bulk of these. Not yet planned.
 
-### libharlem-shake.so data_ptr FNs (9199)
+### libharlem-shake.so data_ptr FNs (8060)
 
-Likely relocation-dependent pointers in `.data.rel.ro` (suppressed) or pointer tables
-that require reloc context to distinguish from plain integers.
+After reloc data_ptr recovery, 1139 TPs were gained (9199→8060 FNs). Remaining FNs
+are likely pointers in sections not covered by RELATIVE/ABS64 relocs (e.g. COPY relocs,
+indirect symbol pointers, or data sections IDA resolves via type propagation).
 
-### libziggy.so data_ptr FNs (1747)
+### libziggy.so data_ptr FNs (1576)
 
-Same root cause as ARM64 `curl-aarch64` data_ptr FNs — mostly ADD-VA mismatch and
-LDR-unresolved registers.
+After reloc data_ptr recovery, 182 TPs gained (1758→1576 FNs). Remaining FNs are
+mostly ADD-VA mismatch and LDR-unresolved registers (same as ARM64 curl-aarch64).
 
 ### ARM64 call FPs (6 remaining)
 
@@ -234,16 +241,17 @@ Not worth implementing.
 **Fix approach**: The ADD-VA mismatch is a scoring artifact (xr finds the ref, just
 at a different source address). The rest require relocation tables or data-flow.
 
-### x86-64 data_ptr FNs (6168)
+### x86-64 data_ptr FNs (6164 on curl-amd64, 2872 on blackcat.elf)
 
-- **~3435** — in `.rodata`: gcc_except_table LSDA entries. Variable-length ULEB128
-  structures parsed by IDA via exception-personality analysis. Not fixable with simple
-  parsing.
-- **~2322** — in `.data.rel.ro` (suppressed).
-- **~378** — in `.data` where IDA uses relocation info to resolve pointers.
-- **~33** — in `.text`: remaining CMP/SUB FPs we can't filter without function-boundary info.
+curl-amd64 is statically linked (no reloc tables) — FN count unchanged:
+- **~3435** — in `.rodata`: gcc_except_table LSDA entries (ULEB128, not parseable simply)
+- **~2322** — in `.data.rel.ro` (suppressed, no relocs in static binary)
+- **~378** — in `.data` where IDA uses type propagation
+- **~33** — in `.text`: CMP/SUB false negatives
 
-**Fix approach**: No tractable fix identified.
+blackcat.elf improved from 5201→2872 FNs via reloc recovery (+2329 TPs).
+
+**Fix approach**: No tractable fix for statically linked binaries.
 
 ### data_write FNs (ARM64: 360, x86-64: 122)
 
@@ -341,11 +349,12 @@ Not planned — substantial complexity for ~+0.006 overall F1 improvement.
 Data-flow analysis to resolve `JMP Rn` / `BR Xn`. Would recover ~3160–3448 jump FNs.
 Not planned — requires interprocedural analysis.
 
-#### 4. Relocation-aware byte scan for `.data` / `.data.rel.ro`
+#### 4. Relocation-derived data_ptr recovery — DONE (ELF + PE)
 
-Parse ELF relocation tables to confirm which `.data`/`.data.rel.ro` slots hold
-genuine pointer values. Would recover ~3123 FNs (2322 `.data.rel.ro` + ~801 `.data.rel.ro`
-on ARM64 + ~378 `.data` on x86-64) but requires parsing `.rela.dyn`/`.rel.dyn`.
+Parse ELF `.rela.dyn` (R_*_RELATIVE, R_*_64/ABS64) and PE base relocation table
+(IMAGE_REL_BASED_DIR64) to extract pointer pairs. Emit as DataPointer xrefs.
+Recovered ~24k+ TPs across all dynamically-linked ELF binaries. PE gains modest.
+Mach-O fixup chains not yet implemented.
 
 ---
 
@@ -363,6 +372,7 @@ xr/
     loader.rs                    ← ELF/Mach-O/PE parser; Segment struct; byte_scannable/executable flags
                                     PIE rebase (ET_DYN + first PT_LOAD at 0 → +0x400000)
                                     got_slots: HashSet<Va> from GLOB_DAT/JUMP_SLOT relocs
+                                    reloc_pointers: Vec<(Va,Va)> from ELF .rela.dyn + PE .reloc
     pass.rs                      ← XrefPass: orchestrates parallel scan; invokes arch scanners
                                     min_ref_va post-dedup filter
     arch/
@@ -419,6 +429,9 @@ xr/
 | x86-64 CMP/SUB imm32 data_ptr | `src/arch/x86_64.rs` | `imm_as_address()` helper |
 | GOT-indirect xref emission | `src/arch/x86_64.rs` | `emit_got_indirect()` — FF15/FF25 to got_slot_va |
 | Benchmark GOT normalization | `src/bin/benchmark.rs` | `resolve_x86_got_slot()` + `extern_bound()` |
+| ELF reloc pointer extraction | `src/loader.rs` | `build_elf_reloc_pointers()` — R_*_RELATIVE + R_*_64/ABS64 |
+| PE reloc pointer extraction | `src/loader.rs` | `build_pe_reloc_pointers()` — base reloc table DIR64 entries |
+| Reloc pointer emission | `src/pass.rs` | Single batch before code/data shards in `pool.install` |
 | min_ref_va filter | `src/pass.rs` | Post-dedup drop of below-min-va targets |
 | Threading pipeline | `src/pass.rs` | Scan pool → drain relay → output thread via sync_channel |
 | Output chunked parallel format | `src/main.rs` | 8192-record chunks, fold+reduce into Vec<u8>, BufWriter |
@@ -428,6 +441,38 @@ xr/
 ---
 
 ## Session History (most recent first)
+
+### Session N+7 — Relocation-table data_ptr recovery (ELF + PE)
+
+**Goal**: Recover data_ptr xrefs from relocation tables, targeting the ~75% of all FNs
+that are data_ptr. Pointers in `.data.rel.ro` (suppressed from byte scan) and other
+relocation-covered sections are authoritative — the reloc table says exactly which
+slots are pointers and what they point to.
+
+**Changes:**
+
+1. **`src/loader.rs`** — Added `reloc_pointers: Vec<(Va, Va)>` to `LoadedBinary` and
+   `ParseResult`. Two new functions:
+   - `build_elf_reloc_pointers()`: parses `.rela.dyn` / `.rel.dyn` for `R_*_RELATIVE`
+     (target = pie_base + addend) and `R_*_64` / `R_*_ABS64` (target = sym.st_value +
+     pie_base + addend, defined symbols only). Filters to targets within mapped segments.
+   - `build_pe_reloc_pointers()`: parses PE base relocation table blocks, reads 64-bit
+     pointer values at `IMAGE_REL_BASED_DIR64` slots, filters to mapped targets.
+
+2. **`src/pass.rs`** — Emits `reloc_pointers` as a single batch of `DataPointer` xrefs
+   (confidence = ByteScan) at the start of `pool.install`, before code and data shards.
+   Applies `min_ref_va`, `from_range`, and `to_range` filters.
+
+**Score delta (data_ptr, selected binaries):**
+- blackcat.elf: F1 **0.766 → 0.883** (+2329 TPs), overall F1 0.937→0.952
+- libssl3-amd64: F1 **0.511 → 0.732** (+2335 TPs), overall F1 0.873→0.916
+- libcurl-arm64: F1 **0.642 → 0.736** (+1246 TPs), overall F1 0.886→0.902
+- libziggy.so: F1 **0.172 → 0.317** (+182 TPs), overall F1 0.816→0.836
+- libDJIFlySafeCore: F1 **0.450 → 0.589** (+13134 TPs), overall F1 0.847→0.869
+
+**No regressions.** Statically linked binaries (curl-amd64, curl-aarch64) unaffected.
+PE gains modest (dwritemin.dll: only 3114 of 42228 FNs are in base reloc table).
+Mach-O fixup chains not yet implemented.
 
 ### Session N+6 — GOT slot VA approach (replace extern VA algorithm)
 

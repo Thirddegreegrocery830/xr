@@ -113,7 +113,7 @@ Concretely:
 
 ---
 
-## 2. Relocation-table data_ptr recovery
+## 2. Relocation-table data_ptr recovery ✅ DONE (ELF + PE)
 
 ### Problem
 
@@ -355,8 +355,7 @@ from local analysis of the instruction sequence, not from a full CFG.
 ## Priority order
 
 1. ~~**GOT fix** — pure bugfix, highest F1 impact per line of code changed~~ ✅ DONE
-2. **Reloc data_ptr** — biggest FN category (75%), moderate implementation
-   effort
+2. ~~**Reloc data_ptr** — biggest FN category (75%), moderate implementation effort~~ ✅ DONE (ELF + PE)
 3. **Jump tables** — meaningful FN reduction, most implementation effort
 
 ---
@@ -383,3 +382,32 @@ Key results (Paired depth, call metrics):
 | libpjsip-everything   | 1.000     | 0.994    | 0.997   | 200            |
 
 No regressions on any of the 20 test binaries.
+
+---
+
+## Results after workstream 2
+
+Implementation: added `reloc_pointers: Vec<(Va, Va)>` to `LoadedBinary`
+and `ParseResult`. Populated by `build_elf_reloc_pointers` (R_*_RELATIVE,
+R_*_64/ABS64 from `.rela.dyn`) and `build_pe_reloc_pointers` (base
+relocation table, IMAGE_REL_BASED_DIR64). Emitted as `DataPointer` xrefs
+in a single batch in `XrefPass::run`. Mach-O not yet implemented.
+
+Key results (Paired depth, data_ptr metrics, before → after):
+
+| Binary                | data_ptr rec | data_ptr F1 | Δ TPs  |
+|-----------------------|--------------|-------------|--------|
+| blackcat.elf          | 0.621→0.791  | 0.766→0.883 | +2329  |
+| libssl3-amd64.so.3    | 0.343→0.578  | 0.511→0.732 | +2335  |
+| libssl3-arm64.so.3    | 0.315→0.472  | 0.449→0.605 | +2380  |
+| libcurl-arm64.so      | 0.474→0.584  | 0.642→0.736 | +1246  |
+| libcurl-x86.so        | 0.524→0.683  | 0.687→0.811 | +1209  |
+| libDJIFlySafeCore.so  | 0.309→0.443  | 0.450→0.589 | +13134 |
+| libpjsip-everything   | 0.421→0.480  | 0.590→0.646 | +1812  |
+| libziggy.so           | 0.094→0.188  | 0.172→0.317 | +182   |
+| hello-linux-gcc       | 0.470→0.684  | 0.635→0.807 | +633   |
+
+Overall F1 improvements on 10+ binaries. No regressions on any binary.
+PE reloc parsing adds modest improvements (3114 entries on dwritemin.dll).
+Statically linked binaries (curl-amd64, curl-aarch64) unaffected.
+Mach-O fixup chains not yet implemented (692 FNs on hello.aarch64-apple-darwin).
