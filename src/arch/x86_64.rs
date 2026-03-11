@@ -48,6 +48,17 @@ fn mem_op_is_write(
     )
 }
 
+/// Whether the decode loop should track register state for resolving
+/// indirect calls/jumps and jump tables.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PropMode {
+    /// Depth 1: direct branches, RIP-relative, GOT-indirect, imm-as-address only.
+    Off,
+    /// Depth 2: adds MOV/LEA register propagation, indirect CALL/JMP
+    /// resolution, and CMP+MOVSXD+ADD+JMP jump table recovery.
+    On,
+}
+
 /// Depth 1: linear disassembly — direct branches, RIP-relative, and
 /// immediate-as-address only. No register propagation, no jump tables.
 pub(crate) fn scan_linear(
@@ -56,7 +67,7 @@ pub(crate) fn scan_linear(
     got_slots: &HashSet<Va>,
     data_idx: &SegmentDataIndex,
 ) -> XrefSet {
-    scan_core(region, idx, got_slots, data_idx, false)
+    scan_core(region, idx, got_slots, data_idx, PropMode::Off)
 }
 
 /// Depth 2: linear disassembly + register constant propagation + jump table
@@ -67,20 +78,16 @@ pub(crate) fn scan_with_prop(
     got_slots: &HashSet<Va>,
     data_idx: &SegmentDataIndex,
 ) -> XrefSet {
-    scan_core(region, idx, got_slots, data_idx, true)
+    scan_core(region, idx, got_slots, data_idx, PropMode::On)
 }
 
 /// Shared decode loop for both depth levels.
-///
-/// When `propagate` is false, register tracking and jump table recovery are
-/// skipped entirely — the loop only emits xrefs from immediate operands,
-/// RIP-relative memory operands, and GOT-indirect calls/jumps.
 fn scan_core(
     region: &ScanRegion,
     idx: &SegmentIndex,
     got_slots: &HashSet<Va>,
     data_idx: &SegmentDataIndex,
-    propagate: bool,
+    prop: PropMode,
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
@@ -113,7 +120,7 @@ fn scan_core(
         emit_rip_relative(&insn, va, idx, &mut info_factory, &mut xrefs);
 
         // Propagation-only: resolve indirect call/jmp from tracked register state.
-        if propagate {
+        if prop == PropMode::On {
             match insn.code() {
                 Code::Call_rm64 | Code::Jmp_rm64 => {
                     if insn.op0_kind() == OpKind::Register {
@@ -160,7 +167,7 @@ fn scan_core(
         }
 
         // Propagation-only: update register / jump table / CMP tracking.
-        if propagate {
+        if prop == PropMode::On {
             update_jt_state(&insn, &reg_vals, &cmp_bound, &mut jt_info);
             update_cmp_state(&insn, &mut cmp_bound);
             update_prop_state(&insn, &mut reg_vals);
