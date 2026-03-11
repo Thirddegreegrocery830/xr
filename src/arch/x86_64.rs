@@ -48,26 +48,39 @@ fn mem_op_is_write(
     )
 }
 
-/// Depth 1: linear disassembly. Delegates to `scan_with_prop` — the register
-/// propagation adds negligible cost and the extra resolved xrefs are harmless
-/// (they're correct, just not required at depth 1).
+/// Depth 1: linear disassembly — direct branches, RIP-relative, and
+/// immediate-as-address only. No register propagation, no jump tables.
 pub(crate) fn scan_linear(
     region: &ScanRegion,
     idx: &SegmentIndex,
     got_slots: &HashSet<Va>,
     data_idx: &SegmentDataIndex,
 ) -> XrefSet {
-    scan_with_prop(region, idx, got_slots, data_idx)
+    scan_core(region, idx, got_slots, data_idx, false)
 }
 
-/// Depth 2: linear disassembly + simple register constant propagation.
-/// Catches `mov rax, imm64 / call rax` and similar patterns, plus
-/// jump table recovery (LEA + MOVSXD + ADD + JMP reg).
+/// Depth 2: linear disassembly + register constant propagation + jump table
+/// recovery. Catches `mov rax, imm64 / call rax` and CMP+LEA+MOVSXD+ADD+JMP.
 pub(crate) fn scan_with_prop(
     region: &ScanRegion,
     idx: &SegmentIndex,
     got_slots: &HashSet<Va>,
     data_idx: &SegmentDataIndex,
+) -> XrefSet {
+    scan_core(region, idx, got_slots, data_idx, true)
+}
+
+/// Shared decode loop for both depth levels.
+///
+/// When `propagate` is false, register tracking and jump table recovery are
+/// skipped entirely — the loop only emits xrefs from immediate operands,
+/// RIP-relative memory operands, and GOT-indirect calls/jumps.
+fn scan_core(
+    region: &ScanRegion,
+    idx: &SegmentIndex,
+    got_slots: &HashSet<Va>,
+    data_idx: &SegmentDataIndex,
+    propagate: bool,
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
@@ -75,14 +88,9 @@ pub(crate) fn scan_with_prop(
 
     let region_is_exec = idx.is_exec(region.base_va);
 
-    // Track known constant values per register (GPRs 0..16 for RAX..R15)
+    // Register propagation state — only allocated/updated when `propagate` is true.
     let mut reg_vals: [Option<u64>; 16] = [None; 16];
-
     let mut jt_info: [Option<JumpTableInfo>; 16] = [None; 16];
-
-    // CMP bound tracking: when `CMP rN, imm` is seen, record `imm+1` as the
-    // maximum number of valid table entries for register N. Propagated through
-    // register-to-register MOV so `mov eax, ebx` preserves ebx's bound.
     let mut cmp_bound: [Option<u32>; 16] = [None; 16];
 
     let mut decoder = Decoder::with_ip(64, data, base, DecoderOptions::NONE);
@@ -97,53 +105,47 @@ pub(crate) fn scan_with_prop(
 
         let va = insn.ip();
 
-        // Depth-1 branch/call xrefs — only from executable regions.
+        // Direct branch/call xrefs — only from executable regions.
         if region_is_exec {
             emit_direct_branches(&insn, va, idx, got_slots, &mut xrefs);
         }
 
         emit_rip_relative(&insn, va, idx, &mut info_factory, &mut xrefs);
 
-        // Indirect call/jmp via register — try to resolve from prop state
-        match insn.code() {
-            Code::Call_rm64 | Code::Jmp_rm64 => {
-                if insn.op0_kind() == OpKind::Register {
-                    let reg = insn.op0_register();
-                    if let Some(ri) = gpr_index(reg) {
-                        if let Some(known) = reg_vals[ri] {
-                            if idx.contains(Va(known)) {
-                                let kind = if insn.code() == Code::Call_rm64 {
-                                    XrefKind::Call
-                                } else {
-                                    XrefKind::Jump
-                                };
-                                xrefs.push(Xref {
-                                    from: Va(va),
-                                    to: Va(known),
-                                    kind,
-                                    confidence: Confidence::LocalProp,
-                                });
-                            }
-                        } else if insn.code() == Code::Jmp_rm64 {
-                            // Jump table recovery: if the register was loaded
-                            // from a table via MOVSXD+ADD, read all entries.
-                            if let Some(jt) = jt_info[ri] {
-                                recover_jump_table(
-                                    Va(va),
-                                    jt,
-                                    data_idx,
-                                    idx,
-                                    &mut xrefs,
-                                );
+        // Propagation-only: resolve indirect call/jmp from tracked register state.
+        if propagate {
+            match insn.code() {
+                Code::Call_rm64 | Code::Jmp_rm64 => {
+                    if insn.op0_kind() == OpKind::Register {
+                        let reg = insn.op0_register();
+                        if let Some(ri) = gpr_index(reg) {
+                            if let Some(known) = reg_vals[ri] {
+                                if idx.contains(Va(known)) {
+                                    let kind = if insn.code() == Code::Call_rm64 {
+                                        XrefKind::Call
+                                    } else {
+                                        XrefKind::Jump
+                                    };
+                                    xrefs.push(Xref {
+                                        from: Va(va),
+                                        to: Va(known),
+                                        kind,
+                                        confidence: Confidence::LocalProp,
+                                    });
+                                }
+                            } else if insn.code() == Code::Jmp_rm64 {
+                                if let Some(jt) = jt_info[ri] {
+                                    recover_jump_table(Va(va), jt, data_idx, idx, &mut xrefs);
+                                }
                             }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
 
-        // Immediate-as-pointer (same criteria as in scan_linear_with_index).
+        // Immediate-as-pointer.
         if region_is_exec {
             if let Some(imm) = imm_as_address(&insn) {
                 if idx.contains(Va(imm)) {
@@ -157,13 +159,12 @@ pub(crate) fn scan_with_prop(
             }
         }
 
-        // Update jump table state (must run BEFORE update_prop_state so it
-        // reads the old reg_vals for base-register verification).
-        update_jt_state(&insn, &reg_vals, &cmp_bound, &mut jt_info);
-
-        // Update CMP bound tracking and propagation state.
-        update_cmp_state(&insn, &mut cmp_bound);
-        update_prop_state(&insn, &mut reg_vals);
+        // Propagation-only: update register / jump table / CMP tracking.
+        if propagate {
+            update_jt_state(&insn, &reg_vals, &cmp_bound, &mut jt_info);
+            update_cmp_state(&insn, &mut cmp_bound);
+            update_prop_state(&insn, &mut reg_vals);
+        }
     }
 
     xrefs
