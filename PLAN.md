@@ -1,6 +1,6 @@
 # Recall improvement plan
 
-Three independent workstreams. Each can be implemented and tested in isolation.
+Four independent workstreams. Each can be implemented and tested in isolation.
 
 ---
 
@@ -172,17 +172,20 @@ address.
    scan replaces the blanket exclusion. (Or keep the exclusion for the
    byte scanner but add reloc-based pointers on top.)
 
-### PE implementation
+### PE implementation ✅ DONE
 
-1. PE has a `.reloc` section (base relocation table) with
-   `IMAGE_REL_BASED_DIR64` entries. Each entry gives an RVA where the
-   loader writes a relocated pointer.
+1. PE `.reloc` section (base relocation table): `build_pe_reloc_pointers()`
+   reads `IMAGE_REL_BASED_DIR64` entries and the 64-bit pointer at each slot.
 
-2. Read the pointer value at each relocated slot. If it points into a
-   mapped segment, emit a `DataPointer` xref.
+2. PE `.pdata` exception directory: `build_pe_pdata_xrefs()` parses
+   RUNTIME_FUNCTION entries (3 u32 RVAs each), emits 4 data_ptr xrefs per
+   entry matching IDA's exact convention.
 
-3. PE also has the Import Address Table (IAT) — each entry is a pointer
-   to an imported function. Parse the IAT and emit `DataPointer` xrefs.
+3. PE UNWIND_INFO: `build_pe_unwind_handler_xrefs()` extracts ExceptionHandler
+   RVA from unwind info structures with UNW_FLAG_EHANDLER/UHANDLER.
+
+4. PE IAT: `build_pe_iat_slots()` populates `got_slots` from import table
+   for indirect call/jump resolution.
 
 ### Mach-O implementation
 
@@ -357,6 +360,7 @@ from local analysis of the instruction sequence, not from a full CFG.
 1. ~~**GOT fix** — pure bugfix, highest F1 impact per line of code changed~~ ✅ DONE
 2. ~~**Reloc data_ptr** — biggest FN category (75%), moderate implementation effort~~ ✅ DONE (ELF + PE)
 3. ~~**Jump tables** — meaningful FN reduction, most implementation effort~~ ✅ DONE (x86-64)
+4. ~~**PE metadata parsing** — .pdata + UNWIND_INFO + IAT, ~160 LOC, huge PE gains~~ ✅ DONE
 
 ---
 
@@ -461,3 +465,113 @@ Overall F1 improvements (selected binaries):
 
 No regressions on any of the 19 test binaries.
 ARM64 binaries unaffected (ARM64 jump table recovery not yet implemented).
+
+---
+
+## 4. PE structured metadata parsing ✅ DONE
+
+### Problem
+
+PE binaries scored poorly (F1 0.72–0.89) compared to ELF (F1 0.87–0.97).
+Root causes:
+- PE `got_slots` was empty — `emit_got_indirect` never fired for PE
+- PE exception directory (`.pdata`) contains thousands of data_ptr xrefs
+  as 32-bit image-relative RVAs, invisible to the 8-byte pointer scanner
+- PE UNWIND_INFO structures contain exception handler RVAs
+- `image_base` references from `.pdata` entries were filtered by `min_ref_va`
+  because image_base sits below the first section
+
+### Approach
+
+Parse three levels of PE structured metadata:
+
+1. **IAT slots**: populate `got_slots` from `pe.imports[].rva` so the x86-64
+   scanner's indirect call/jump handling works for PE
+2. **.pdata RUNTIME_FUNCTION**: each 12-byte entry has 3 u32 RVAs
+   (BeginAddress, EndAddress, UnwindInfoAddress); IDA emits 4 data_ptr xrefs
+   per entry, all from the entry's start VA:
+   - (entry_va, image_base)
+   - (entry_va, image_base + BeginAddress)
+   - (entry_va, image_base + EndAddress)
+   - (entry_va, image_base + UnwindInfoAddress)
+3. **UNWIND_INFO ExceptionHandler**: when flags include UNW_FLAG_EHANDLER or
+   UNW_FLAG_UHANDLER, the handler RVA follows the unwind codes (after
+   4-byte alignment padding)
+
+Additionally, exempt `reloc_pointers` from `min_ref_va` filtering since
+they are authoritative metadata (not heuristic byte-scan results).
+
+### Implementation
+
+- `src/loader.rs`: `build_pe_iat_slots()`, `build_pe_pdata_xrefs()`,
+  `build_pe_unwind_handler_xrefs()` — all called from `parse_pe()`
+- `src/pass.rs`: reloc_pointers batch no longer filtered by `min_ref_va`
+- `src/bin/benchmark.rs`: broadened extern normalization to all xref kinds
+
+~160 lines of Rust total.
+
+### Key discoveries during implementation
+
+- **IDA .pdata xref attribution**: IDA attributes all 4 RVA targets to the
+  entry's start VA (BeginAddress field), not to each field's own VA. Using
+  field offsets as `from` produces 0 TP.
+- **image_base as target**: IDA emits `(entry_va, image_base)` for every
+  .pdata entry. image_base points at the PE header before the first section,
+  so `seg_set.contains()` and `min_ref_va` both reject it. Must be emitted
+  unconditionally and bypass `min_ref_va`.
+- **UNWIND_INFO handler only**: parsing scope tables (the data after the
+  handler RVA) produces high FP because layout varies by handler type.
+  The handler RVA alone is 100% precise (2438 TP, 0 FP).
+- **Blind RVA scan unviable**: scanning .rdata for arbitrary u32 values
+  that look like valid RVAs: 14.5% precision. Not usable.
+
+### Verification
+
+- concrt140.dll ground truth anomaly: IDA emits 0 .pdata xrefs for this
+  binary (likely analysis issue), causing all 4616 pdata xrefs to be FP.
+  This is a ground truth issue, not a scanner issue.
+
+### Files modified
+
+- `src/loader.rs`: `build_pe_iat_slots()`, `build_pe_pdata_xrefs()`,
+  `build_pe_unwind_handler_xrefs()`, `RelocPointer` struct, `Symbol` struct
+- `src/pass.rs`: reloc_pointers bypass `min_ref_va`
+- `src/arch/mod.rs`: `SegFlags` newtype
+- `src/bin/benchmark.rs`: broadened extern normalization
+
+---
+
+## Results after workstream 4 (PE metadata parsing)
+
+Implementation: three new PE parsing functions in `src/loader.rs`:
+`build_pe_iat_slots()` for GOT slot population, `build_pe_pdata_xrefs()`
+for exception directory RUNTIME_FUNCTION entries, and
+`build_pe_unwind_handler_xrefs()` for UNWIND_INFO ExceptionHandler RVAs.
+`reloc_pointers` batch in `pass.rs` exempted from `min_ref_va` filtering.
+
+Key results (PE binaries, overall F1, Paired depth):
+
+| Binary | F1 before | F1 after | Δ |
+|--------|-----------|----------|---|
+| win32kbase_rs.sys | 0.894 | 0.995 | +0.101 |
+| simple.exe | 0.736 | 0.890 | +0.154 |
+| dwritemin.dll | 0.724 | 0.869 | +0.145 |
+| hello.x86_64-pc-windows-gnu.exe | 0.878 | 0.954 | +0.076 |
+| sudo.exe | 0.859 | 0.918 | +0.059 |
+
+New MSVC DLL scores (first measurement, Paired depth):
+
+| Binary | F1 | Notes |
+|--------|-----|-------|
+| vcomp140.dll | 0.869 | MSVC OpenMP, x86-64 |
+| vccorlib140.dll | 0.759 | MSVC WinRT/COM, x86-64 |
+| vcruntime140.dll | 0.732 | MSVC CRT, x86-64 |
+| msvcp140.dll | 0.701 | MSVC C++ STL, x86-64 |
+| concrt140-arm64.dll | 0.623 | MSVC Concurrency RT, ARM64 |
+| concrt140.dll | 0.561 | MSVC Concurrency RT, x86-64 (ground truth issue†) |
+| vcruntime140-arm64.dll | 0.752 | MSVC CRT, ARM64 |
+
+† concrt140.dll: IDA ground truth emits 0 .pdata xrefs; all 4616 pdata
+  xrefs from xr count as FP. True scanner accuracy is significantly higher.
+
+No regressions on any ELF or Mach-O binary.

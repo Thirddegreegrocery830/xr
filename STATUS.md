@@ -68,14 +68,28 @@ ground-truth xrefs. Maximise F1 score across all xref kinds.
 |--------|------------|
 | hello-linux-gcc (x86-64 PIE ELF) | 0.914 |
 | libssl3-amd64.so.3 (x86-64 ELF) | 0.925 |
+| libssl3-arm64.so.3 (AArch64 ELF) | 0.837 |
 | libcurl-arm64.so (AArch64 ELF)   | 0.902 |
 | libcurl-x86.so (x86-64 ELF)     | 0.954 |
 | libpjsip-everything.so (x86-64)  | 0.911 |
+| libpjsip.so.2 (x86-64 ELF)     | 0.914 |
+| libDJIFlySafeCore.so (AArch64 ELF) | 0.869 |
 | hello.aarch64-apple-darwin (Mach-O) | 0.946 |
-| hello.x86_64-pc-windows-gnu.exe (PE) | 0.878 |
-| simple.exe (PE) | 0.736 |
-| sudo.exe (PE) | 0.859 |
-| win32kbase_rs.sys (PE driver) | 0.894 |
+| hello.x86_64-pc-windows-gnu.exe (PE x86-64, MinGW) | 0.954 |
+| simple.exe (PE x86-64, Rust+MSVC) | 0.890 |
+| sudo.exe (PE x86-64, Rust+MSVC) | 0.918 |
+| win32kbase_rs.sys (PE x86-64, Rust driver) | 0.995 |
+| dwritemin.dll (PE x86-64, MSVC C++) | 0.869 |
+| concrt140.dll (PE x86-64, MSVC C++) | 0.561 † |
+| msvcp140.dll (PE x86-64, MSVC C++) | 0.701 |
+| vccorlib140.dll (PE x86-64, MSVC C++) | 0.759 |
+| vcomp140.dll (PE x86-64, MSVC C++) | 0.869 |
+| vcruntime140.dll (PE x86-64, MSVC C++) | 0.732 |
+| concrt140-arm64.dll (PE ARM64, MSVC C++) | 0.623 |
+| vcruntime140-arm64.dll (PE ARM64, MSVC C++) | 0.752 |
+
+† concrt140.dll score is artificially low: IDA ground truth emits 0 .pdata xrefs
+  for this binary (analysis issue), causing ~4616 FP from xr's correct pdata parsing.
 
 ---
 
@@ -156,10 +170,22 @@ Each binary is split into `Segment` structs with:
 | `min_ref_va` post-dedup filter | libharlem FP −large | Drops xrefs whose `to` VA is below the binary's lowest mapped address |
 | Ground truth cleanup | all PIE ELFs | Removed IDA type-system xrefs; rebased libziggy+libharlem JSON by +0x400000 |
 
+| PE IAT slot population | PE +0.004–0.017 | `build_pe_iat_slots()` populates `got_slots` from PE import table; enables x86-64 scanner's `emit_got_indirect` for PE indirect call/jmp through IAT |
+| PE .pdata exception directory parsing | PE +0.056–0.153 | Parse RUNTIME_FUNCTION entries (12-byte structs with 3 RVAs); emit 4 data_ptr xrefs per entry (image_base + 3 resolved targets) all from entry start VA |
+| PE UNWIND_INFO handler RVA extraction | PE +0.001–0.008 | Parse ExceptionHandler RVA from UNWIND_INFO structures; 100% precision (2438 TP, 0 FP across all PE binaries) |
+| reloc_pointers bypass min_ref_va | PE +0.005–0.077 | Reloc-derived xrefs are authoritative metadata; exempt from min_ref_va filtering (image_base is below first section, was wrongly suppressed) |
+| Type system: SegFlags newtype | — | Replace raw u8 bitmask with newtype in `src/arch/mod.rs` |
+| Type system: RelocPointer struct | — | Replace `(Va, Va)` tuples in `src/loader.rs` |
+| Type system: Symbol struct | — | Replace `(String, Va)` tuples |
+| FxHashSet for got_slots | — | Replace `HashSet<Va>` with `FxHashSet<Va>` for faster hot-path GOT lookups |
+
 ### Fixes that were tried and reverted/abandoned
 
 | Fix | Why abandoned |
 |-----|---------------|
+| .pdata xrefs with field-offset `from` addresses | IDA attributes all 4 pdata xrefs to entry start VA (+0), not individual field offsets (+0/+4/+8). Using field offsets produced 0 TP, 2308 FP. |
+| Blind 32-bit RVA scan of .rdata | Scanning all 4-byte-aligned .rdata slots for valid RVAs: 14.5% precision, 34.4% recall. Too many random u32 values match. |
+| UNWIND_INFO scope table parsing | Scope table layout varies by handler type (__C_specific_handler vs __CxxFrameHandler3 etc). Parsing all as __C_specific_handler: 1090 TP but 2937 FP. Handler RVA alone is 100% precise. |
 | Re-enable ADD-VA data_ptr | +6496 TPs but +6981 FPs; net ARM64 F1 +0.001, not worth it |
 | Remove exec-target suppression for byte scan | +3 TPs, +275 FPs on x86-64; worse F1 |
 | Section-granular split of writable PT_LOAD | `.data` byte scan: 241 TPs but 548 FPs (mostly `.data`→`.rodata` pointers IDA doesn't record) |
@@ -262,6 +288,53 @@ blackcat.elf improved from 5201→2872 FNs via reloc recovery (+2329 TPs).
 - x86-64: 122 FNs; same pattern (indirect stores through registers).
 
 **Fix approach**: Not planned. Requires interprocedural data-flow.
+
+### PE data_ptr FNs (MSVC C++ EH/RTTI structures)
+
+The dominant remaining PE FN category is `data_ptr` in `.rdata`, caused by
+MSVC C++ exception handling and RTTI metadata. These structures store
+function/data references as **32-bit image-relative RVAs** (not 64-bit pointers),
+which the 8-byte pointer scanner cannot detect.
+
+Structure types involved:
+- `_s_FuncInfo`, `_s_HandlerType`, `_s_TryBlockMapEntry` — C++ EH dispatch tables
+- `_s_UnwindMapEntry`, `_s_ESTypeList` — C++ EH cleanup/catch tables
+- `TypeDescriptor`, `RTTICompleteObjectLocator` — RTTI metadata
+- These contain packed 32-bit RVA pairs (two per 8 bytes), not full pointers
+
+Scale across MSVC DLLs:
+- dwritemin.dll: ~9,933 data_ptr FN from 32-bit RVAs in .rdata
+- msvcp140.dll: ~12,422 data_ptr FN total
+- vccorlib140.dll: ~8,269 data_ptr FN total
+
+**Fix approach**: Parsing individual MSVC EH structures is complex (layout varies
+by handler type, version-dependent). Blind 32-bit RVA scanning has 14.5% precision.
+No tractable fix without deep MSVC EH metadata parsing.
+
+### PE extern-target xref mismatch
+
+IDA assigns synthetic extern VAs (`0xff00000000000Xxx`) to imported functions.
+When code accesses IAT slots (e.g., `MOV reg, [rip+IAT_slot]`), IDA records
+the xref target as the extern VA while xr records the IAT slot VA. Additionally,
+IDA sometimes attributes the xref to a different instruction address within the
+same basic block.
+
+Scale: 1,493 extern xrefs in vcomp140.dll, 9,103 in msvcp140.dll.
+
+The benchmark normalizes some of these via `resolve_x86_got_slot()`, but
+IDA's `from` address mismatches cause many to remain FN regardless.
+
+**Fix approach**: Benchmark measurement issue, not a scanner deficiency.
+
+### PE switch table jumps
+
+IDA resolves switch-table indirect jumps in PE binaries. xr's x86-64 jump table
+recovery works but contributes ~200–1200 jump FN per PE binary, primarily from:
+- Switch tables where CMP bound tracking fails (different compiler patterns)
+- Register-based indirect jumps (`JMP reg`) without recoverable table
+
+**Fix approach**: Existing CMP+MOVSXD+ADD+JMP pattern covers GCC/Clang/MSVC
+common patterns. Remaining cases require broader pattern recognition.
 
 ---
 
@@ -381,8 +454,9 @@ xr/
     shard.rs                     ← split_range: parallel shard boundaries
     loader.rs                    ← ELF/Mach-O/PE parser; Segment struct; byte_scannable/executable flags
                                     PIE rebase (ET_DYN + first PT_LOAD at 0 → +0x400000)
-                                    got_slots: HashSet<Va> from GLOB_DAT/JUMP_SLOT relocs
-                                    reloc_pointers: Vec<(Va,Va)> from ELF .rela.dyn + PE .reloc
+                                    got_slots: FxHashSet<Va> from GLOB_DAT/JUMP_SLOT + PE IAT
+                                    reloc_pointers: Vec<RelocPointer> from ELF .rela.dyn + PE .reloc/.pdata/UNWIND_INFO
+                                    RelocPointer, Symbol structs; PeSectionMap, VaRangeSet helpers
     pass.rs                      ← XrefPass: orchestrates parallel scan; invokes arch scanners
                                     min_ref_va post-dedup filter
     arch/
@@ -397,26 +471,44 @@ xr/
                                      --dump-fps/fns/tps --dump-kind --min-ref-va
 
   testcases/
-    curl-amd64                   ← x86-64 ELF, stripped
-    curl-amd64.xrefs.json        ← IDA ground truth
-    curl-aarch64                 ← ARM64 ELF, stripped
-    curl-aarch64.xrefs.json      ← IDA ground truth
+    curl-amd64                   ← x86-64 ELF, stripped, statically linked
+    curl-aarch64                 ← ARM64 ELF, stripped, statically linked
+    blackcat.elf                 ← x86-64 PIE ELF, large
     libharlem-shake.so           ← x86-64 PIE ELF (Rust, many external symbol calls)
-    libharlem-shake.so.xrefs.json← IDA ground truth (rebased +0x400000)
     libziggy.so                  ← AArch64 PIE ELF (Rust)
-    libziggy.so.xrefs.json       ← IDA ground truth (rebased +0x400000)
+    libssl3-amd64.so.3           ← x86-64 ELF
+    libssl3-arm64.so.3           ← AArch64 ELF
+    libcurl-arm64.so             ← AArch64 ELF
+    libcurl-x86.so               ← x86-64 ELF
+    libpjsip-everything.so       ← x86-64 ELF
+    libpjsip.so.2                ← x86-64 ELF
+    libDJIFlySafeCore.so         ← AArch64 ELF
+    hello-linux-gcc              ← x86-64 PIE ELF (GCC)
     hello.aarch64-apple-darwin   ← Mach-O ARM64
-    hello.x86_64-pc-windows-gnu.exe ← PE x86-64
-    simple.exe                   ← PE x86-64 (small)
+    hello.x86_64-pc-windows-gnu.exe ← PE x86-64 (MinGW)
+    simple.exe                   ← PE x86-64 (Rust+MSVC)
+    sudo.exe                     ← PE x86-64 (Rust+MSVC)
+    win32kbase_rs.sys            ← PE x86-64 (Rust kernel driver)
+    dwritemin.dll                ← PE x86-64 (MSVC C++)
+    concrt140.dll                ← PE x86-64 (MSVC Concurrency Runtime)
+    concrt140-arm64.dll          ← PE ARM64 (MSVC Concurrency Runtime)
+    msvcp140.dll                 ← PE x86-64 (MSVC C++ STL)
+    vccorlib140.dll              ← PE x86-64 (MSVC WinRT/COM)
+    vcomp140.dll                 ← PE x86-64 (MSVC OpenMP)
+    vcruntime140.dll             ← PE x86-64 (MSVC CRT)
+    vcruntime140-arm64.dll       ← PE ARM64 (MSVC CRT)
+    *.xrefs.json                 ← IDA ground truth (per binary)
 
   scripts/
+    ida_extract_xrefs.py         ← IDA Pro script for ground-truth extraction
+    batch_extract_xrefs.sh       ← batch IDA ground truth for all testcases
+    score_all.sh                 ← run benchmark on all testcases, summary table
     analyze_fn_datawrite.py
     analyze_fn_datawrite2.py
     analyze_adrp_distance.py
     simulate_reg_tracker.py
     analyze_fp_dataptr.py
     analyze_fp_dataptr2.py
-    ida_extract_xrefs_binary.py  ← IDA Pro script for ground-truth extraction
 ```
 
 ---
@@ -429,7 +521,7 @@ xr/
 | PIE ELF rebase | `src/loader.rs:~293` | ET_DYN + first PT_LOAD at 0 → pie_base=0x400000 |
 | ELF exec section-granular split | `src/loader.rs:~336` | NON_CODE_SECTIONS list |
 | `.data.rel.ro` suppression | `src/loader.rs:~229` | NO_SCAN_SECTIONS list |
-| got_slots field | `src/loader.rs` | `HashSet<Va>` from GLOB_DAT/JUMP_SLOT relocs; `build_elf_got_slots()` |
+| got_slots field | `src/loader.rs` | `FxHashSet<Va>` from GLOB_DAT/JUMP_SLOT relocs; `build_elf_got_slots()` + `build_pe_iat_slots()` |
 | byte_scan_pointers | `src/arch/mod.rs:40` | Exec-target suppression at line 70 |
 | ARM64 is_tracked fast-path | `src/arch/arm64_decode.rs` | Bitmask classifier; skips decode for ~65% of instructions |
 | ARM64 ADRP scan | `src/arch/arm64.rs` | Two-level decode dispatch; ADR/ADD-VA suppressed |
@@ -443,8 +535,11 @@ xr/
 | Benchmark GOT normalization | `src/bin/benchmark.rs` | `resolve_x86_got_slot()` + `extern_bound()` |
 | ELF reloc pointer extraction | `src/loader.rs` | `build_elf_reloc_pointers()` — R_*_RELATIVE + R_*_64/ABS64 |
 | PE reloc pointer extraction | `src/loader.rs` | `build_pe_reloc_pointers()` — base reloc table DIR64 entries |
-| Reloc pointer emission | `src/pass.rs` | Single batch before code/data shards in `pool.install` |
-| min_ref_va filter | `src/pass.rs` | Post-dedup drop of below-min-va targets |
+| PE .pdata parsing | `src/loader.rs` | `build_pe_pdata_xrefs()` — RUNTIME_FUNCTION 4-xref emission |
+| PE UNWIND_INFO handlers | `src/loader.rs` | `build_pe_unwind_handler_xrefs()` — ExceptionHandler RVA extraction |
+| PE IAT slots | `src/loader.rs` | `build_pe_iat_slots()` — populates got_slots from PE import table |
+| Reloc pointer emission | `src/pass.rs` | Single batch before code/data shards; bypasses min_ref_va |
+| min_ref_va filter | `src/pass.rs` | Post-dedup drop of below-min-va targets (code/data scan only, not reloc_pointers) |
 | Threading pipeline | `src/pass.rs` | Scan pool → drain relay → output thread via sync_channel |
 | Output chunked parallel format | `src/main.rs` | 8192-record chunks, fold+reduce into Vec<u8>, BufWriter |
 | Printer trait (write_record) | `src/output.rs` | Append-to-buf interface; no per-record allocation |
@@ -453,6 +548,65 @@ xr/
 ---
 
 ## Session History (most recent first)
+
+### Session N+9 — PE metadata parsing & MSVC test binaries
+
+**Goal**: Expand PE test coverage with pure MSVC C/C++ binaries and improve PE
+recall by parsing structured binary metadata (exception directory, unwind info).
+
+**Test suite expansion:**
+
+Added 7 pure MSVC DLLs from the VC++ 2022 redistributable:
+- x86-64: `concrt140.dll`, `msvcp140.dll`, `vccorlib140.dll`, `vcomp140.dll`, `vcruntime140.dll`
+- ARM64: `concrt140-arm64.dll`, `vcruntime140-arm64.dll`
+
+These are the first pure MSVC C/C++ binaries and first ARM64 PE testcases.
+Previous PE binaries were all Rust+MinGW or Rust+MSVC-linked.
+
+Generated IDA ground truth (`.xrefs.json`) for all 7 binaries. Fixed
+`ida_extract_xrefs.py` naming for multi-extension files (`.dll.xrefs.json`).
+Added `scripts/score_all.sh` and `scripts/batch_extract_xrefs.sh`.
+
+**Changes:**
+
+1. **`src/loader.rs`** — Four new functions:
+   - `build_pe_iat_slots()`: populates `got_slots` from PE import table
+     (`pe.imports[].rva`), enabling `emit_got_indirect` for PE binaries
+   - `build_pe_pdata_xrefs()`: parses PE exception directory — each
+     RUNTIME_FUNCTION (12 bytes, 3 u32 RVAs) emits 4 data_ptr xrefs
+     (to image_base + 3 resolved targets), all from entry start VA
+   - `build_pe_unwind_handler_xrefs()`: follows .pdata → UNWIND_INFO,
+     extracts ExceptionHandler RVA from entries with UNW_FLAG_EHANDLER
+     or UNW_FLAG_UHANDLER (100% precision: 2438 TP, 0 FP)
+   - Type improvements: `RelocPointer` struct, `Symbol` struct, `SegFlags`
+     newtype, `FxHashSet` for `got_slots`
+
+2. **`src/pass.rs`** — `reloc_pointers` batch now bypasses `min_ref_va`
+   filter. PE .pdata entries emit `(entry_va, image_base)` but image_base
+   is below the first section; min_ref_va was wrongly suppressing ~34K
+   xrefs. Authoritative metadata should not be filtered by heuristic bounds.
+
+3. **`src/arch/mod.rs`** — `SegFlags` newtype replacing raw u8 bitmask.
+
+4. **`src/bin/benchmark.rs`** — Broadened GOT/IAT extern normalization to
+   all xref kinds and all RIP-relative operand positions (not just
+   indirect call/jump).
+
+**Score impact (PE F1, Paired depth):**
+
+| Binary | Before | After | Δ |
+|--------|--------|-------|---|
+| win32kbase_rs.sys | 0.894 | 0.995 | +0.101 |
+| simple.exe | 0.736 | 0.890 | +0.154 |
+| dwritemin.dll | 0.724 | 0.869 | +0.145 |
+| vcomp140.dll | — | 0.869 | (new) |
+| hello.x86_64-pc-windows-gnu.exe | 0.878 | 0.954 | +0.076 |
+| msvcp140.dll | — | 0.701 | (new) |
+| vcruntime140.dll | — | 0.732 | (new) |
+| vccorlib140.dll | — | 0.759 | (new) |
+| sudo.exe | 0.859 | 0.918 | +0.059 |
+
+No regressions on ELF or Mach-O binaries.
 
 ### Session N+8 — x86-64 jump table recovery
 
