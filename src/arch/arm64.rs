@@ -34,6 +34,14 @@ const MAX_JUMP_TABLE_ENTRIES: usize = 8192;
 /// are implausible for jump tables and likely indicate a misidentified pattern.
 const MAX_JUMP_TABLE_SHIFT: u32 = 4;
 
+/// How many instructions backward from the BR we scan for the jump-table
+/// pattern (ADR+LDRB/H+ADD, ADRP+ADD for table base, CMP for bound).
+///
+/// The core pattern (ADR+LDRB/H+ADD+BR) is 4 instructions, but the ADRP+ADD
+/// that set the table base and the CMP that set the bound can be several
+/// instructions earlier.
+const JUMP_TABLE_LOOKBACK: usize = 12;
+
 // ── Register newtype ─────────────────────────────────────────────────────────
 
 /// An ARM64 general-purpose register index in 0..=30 (X0–X30).
@@ -535,12 +543,20 @@ impl JumpTableAddInfo {
     }
 
     /// Read one table entry and apply sign-extension according to this info.
-    fn read_offset(self, entry_sz: JumpTableEntrySize, val_u8: Option<u8>, val_u16: Option<u16>) -> Option<i64> {
+    ///
+    /// `entry_sz` determines the width; the raw value is read from `data_idx`
+    /// at `slot_va`.
+    fn read_offset(
+        self,
+        entry_sz: JumpTableEntrySize,
+        data_idx: &SegmentDataIndex,
+        slot_va: Va,
+    ) -> Option<i64> {
         match (entry_sz, self.sign_extend) {
-            (JumpTableEntrySize::Byte, false) => val_u8.map(|v| v as i64),
-            (JumpTableEntrySize::Byte, true)  => val_u8.map(|v| (v as i8) as i64),
-            (JumpTableEntrySize::Halfword, false) => val_u16.map(|v| v as i64),
-            (JumpTableEntrySize::Halfword, true)  => val_u16.map(|v| (v as i16) as i64),
+            (JumpTableEntrySize::Byte, false) => data_idx.read_u8_at(slot_va).map(|v| v as i64),
+            (JumpTableEntrySize::Byte, true)  => data_idx.read_u8_at(slot_va).map(|v| (v as i8) as i64),
+            (JumpTableEntrySize::Halfword, false) => data_idx.read_u16_at(slot_va).map(|v| v as i64),
+            (JumpTableEntrySize::Halfword, true)  => data_idx.read_u16_at(slot_va).map(|v| (v as i16) as i64),
         }
     }
 }
@@ -615,16 +631,9 @@ fn recover_arm64_jump_table(
 
     for k in 0..limit {
         let slot_va = pattern.table_base + (k as u64) * pattern.entry_size.bytes();
-
-        let offset_val = match pattern.entry_size {
-            JumpTableEntrySize::Byte => {
-                add_info.read_offset(pattern.entry_size, ctx.data_idx.read_u8_at(slot_va), None)
-            }
-            JumpTableEntrySize::Halfword => {
-                add_info.read_offset(pattern.entry_size, None, ctx.data_idx.read_u16_at(slot_va))
-            }
+        let Some(offset_val) = add_info.read_offset(pattern.entry_size, ctx.data_idx, slot_va) else {
+            break;
         };
-        let Some(offset_val) = offset_val else { break };
 
         let shifted = offset_val << add_info.shift;
         let target = Va::new((pattern.target_base.raw() as i64).wrapping_add(shifted) as u64);
@@ -648,14 +657,15 @@ fn recover_arm64_jump_table(
 /// table base register).  CMP bounds are also extracted here as a fallback
 /// when the forward scan clears `cmp_bound` due to register reuse in the LDRH.
 ///
-/// Lookback is 12 instructions: the core pattern (ADR+LDRB/H+ADD+BR) is 4
-/// instructions, but the ADRP+ADD that set the table base and the CMP that
-/// set the bound can be several instructions earlier.
+/// Lookback is [`JUMP_TABLE_LOOKBACK`] instructions: the core pattern
+/// (ADR+LDRB/H+ADD+BR) is 4 instructions, but the ADRP+ADD that set the
+/// table base and the CMP that set the bound can be several instructions
+/// earlier.
 fn scan_backward_for_pattern(
     br_index: usize,
     ctx: &JumpTableCtx,
 ) -> Option<JumpTablePattern> {
-    let lookback = br_index.min(12);
+    let lookback = br_index.min(JUMP_TABLE_LOOKBACK);
 
     let mut target_base: Option<Va> = None;
     // ADD (shifted/extended register) that combines the loaded offset with target_base.
@@ -805,27 +815,24 @@ fn scan_backward_for_pattern(
 
 /// Resolve the table base address from the backward-scan ADRP+ADD results,
 /// falling back to forward-scan `ScanState` if the backward scan didn't find
-/// a matching ADRP (e.g. ADRP was more than 12 instructions before the BR).
+/// a matching ADRP (e.g. ADRP was more than [`JUMP_TABLE_LOOKBACK`]
+/// instructions before the BR).
 fn resolve_table_base(
     tbl_reg: Reg,
     adrp_page: Option<(Reg, u64)>,
     add_imm_val: Option<(Reg, u64)>,
     ctx: &JumpTableCtx,
 ) -> Option<Va> {
-    // Best case: both ADRP and ADD found in the backward scan for tbl_reg.
-    if let (Some((adrp_rd, page)), Some((add_rd, imm))) = (adrp_page, add_imm_val) {
-        if adrp_rd == tbl_reg && add_rd == tbl_reg {
-            return Some(Va::new(page + imm));
-        }
-    }
-    // ADRP only (no ADD offset, or ADD was for a different register).
+    // Try backward-scan ADRP matching the table register.
     if let Some((adrp_rd, page)) = adrp_page {
         if adrp_rd == tbl_reg {
+            // If ADD (immediate) also matches, combine page + offset.
             if let Some((add_rd, imm)) = add_imm_val {
                 if add_rd == tbl_reg {
                     return Some(Va::new(page + imm));
                 }
             }
+            // ADRP only — no ADD offset (or ADD was for a different register).
             return Some(Va::new(page));
         }
     }

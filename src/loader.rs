@@ -1279,10 +1279,15 @@ fn build_pe_pdata_xrefs(
             break;
         }
 
-        let begin_rva = u32::from_le_bytes(bytes[file_off..file_off + 4].try_into().unwrap());
-        let end_rva = u32::from_le_bytes(bytes[file_off + 4..file_off + 8].try_into().unwrap());
-        let unwind_rva =
-            u32::from_le_bytes(bytes[file_off + 8..file_off + 12].try_into().unwrap());
+        let begin_rva = u32::from_le_bytes(
+            bytes[file_off..file_off + 4].try_into().expect("guarded by file_off + 12 <= len"),
+        );
+        let end_rva = u32::from_le_bytes(
+            bytes[file_off + 4..file_off + 8].try_into().expect("guarded by file_off + 12 <= len"),
+        );
+        let unwind_rva = u32::from_le_bytes(
+            bytes[file_off + 8..file_off + 12].try_into().expect("guarded by file_off + 12 <= len"),
+        );
 
         let from = Va::new(image_base + entry_rva as u64);
 
@@ -1336,8 +1341,11 @@ fn build_pe_unwind_handler_xrefs(
         if entry_off + 12 > bytes.len() {
             break;
         }
-        let unwind_rva =
-            u32::from_le_bytes(bytes[entry_off + 8..entry_off + 12].try_into().unwrap()) & !1u32;
+        let unwind_rva = u32::from_le_bytes(
+            bytes[entry_off + 8..entry_off + 12]
+                .try_into()
+                .expect("guarded by entry_off + 12 <= len"),
+        ) & !1u32;
         if unwind_rva == 0 || !seen_unwind.insert(unwind_rva) {
             continue;
         }
@@ -1369,7 +1377,7 @@ fn build_pe_unwind_handler_xrefs(
         let handler_rva = u32::from_le_bytes(
             bytes[handler_file_off..handler_file_off + 4]
                 .try_into()
-                .unwrap(),
+                .expect("guarded by handler_file_off + 4 <= len"),
         );
         if handler_rva == 0 {
             continue;
