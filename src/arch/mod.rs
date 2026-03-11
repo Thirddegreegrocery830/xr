@@ -124,34 +124,30 @@ impl SegmentIndex {
 
 // ── SegmentDataIndex ──────────────────────────────────────────────────────────
 
+/// A single entry in a [`SegmentDataIndex`]: VA range, flags, and data slice.
+struct DataIndexEntry<'a> {
+    start: Va,
+    end: Va,
+    flags: u8,
+    data: &'a [u8],
+}
+
 /// Sorted VA interval table that also carries the raw data slice for each
 /// segment. Used for O(log n) `read_u64_at` in the hot byte-scan and
 /// ADRP/LDR pointer-follow paths — replacing the previous O(n_segments)
 /// `segments.iter().find()` linear scan.
 ///
-/// Each entry is `(start, end, flags, data_ptr, data_len)` where:
-///   - `(start, end)` is the VA range `[start, end)`
-///   - `flags` is the same bitmask as `SegmentIndex` (bit 0 = exec, bit 1 = write)
-///   - `data_ptr` / `data_len` point into the segment's zero-copy backing store
-///
-/// The data pointer is stored as a raw `*const u8` so the struct can be
-/// `Send + Sync`. Safety invariant: the backing allocation (mmap or `_bss_bufs`)
-/// lives at least as long as this index, which is guaranteed because
-/// `SegmentDataIndex` is built from `&LoadedBinary` and only lives within the
-/// same `XrefPass::run()` call that borrows it.
-pub(crate) struct SegmentDataIndex {
+/// The lifetime `'a` ties the data slices to the `&'a LoadedBinary` that
+/// this index was built from, which is the borrow held by `XrefPass::run()`.
+/// No raw pointers or unsafe `Send`/`Sync` impls needed.
+pub(crate) struct SegmentDataIndex<'a> {
     /// Sorted by `start`.
-    entries: Vec<(Va, Va, u8, *const u8, usize)>,
+    entries: Vec<DataIndexEntry<'a>>,
 }
 
-// Safety: the raw pointers inside point into mmaps / Box<[u8]> that are
-// `Send + Sync` themselves; we never mutate through them.
-unsafe impl Send for SegmentDataIndex {}
-unsafe impl Sync for SegmentDataIndex {}
-
-impl SegmentDataIndex {
-    pub(crate) fn build(segments: &[crate::loader::Segment]) -> Self {
-        let mut entries: Vec<(Va, Va, u8, *const u8, usize)> = segments
+impl<'a> SegmentDataIndex<'a> {
+    pub(crate) fn build(segments: &'a [crate::loader::Segment]) -> Self {
+        let mut entries: Vec<DataIndexEntry<'a>> = segments
             .iter()
             .map(|s| {
                 let mut flags = 0u8;
@@ -161,33 +157,31 @@ impl SegmentDataIndex {
                 if s.writable {
                     flags |= FLAG_WRITE;
                 }
-                (
-                    s.va,
-                    s.va + s.data.len() as u64,
+                DataIndexEntry {
+                    start: s.va,
+                    end: s.va + s.data.len() as u64,
                     flags,
-                    s.data.as_ptr(),
-                    s.data.len(),
-                )
+                    data: s.data,
+                }
             })
             .collect();
-        entries.sort_unstable_by_key(|e| e.0);
-        if !entries.windows(2).all(|w| w[0].1 <= w[1].0) {
+        entries.sort_unstable_by_key(|e| e.start);
+        if !entries.windows(2).all(|w| w[0].end <= w[1].start) {
             eprintln!("warning: SegmentDataIndex: overlapping segments detected (binary search may give wrong results)");
         }
         Self { entries }
     }
 
     /// Binary-search for the entry covering `va`.
-    /// Returns `(flags, data_ptr, data_len, start_va)` or `None` if unmapped.
     #[inline]
-    fn entry_at(&self, va: Va) -> Option<(u8, *const u8, usize, Va)> {
-        let idx = self.entries.partition_point(|e| e.0 <= va);
+    fn entry_at(&self, va: Va) -> Option<&DataIndexEntry<'a>> {
+        let idx = self.entries.partition_point(|e| e.start <= va);
         if idx == 0 {
             return None;
         }
-        let (start, end, flags, ptr, len) = self.entries[idx - 1];
-        if va >= start && va < end {
-            Some((flags, ptr, len, start))
+        let e = &self.entries[idx - 1];
+        if va >= e.start && va < e.end {
+            Some(e)
         } else {
             None
         }
@@ -198,24 +192,19 @@ impl SegmentDataIndex {
     /// overflow the segment.
     #[inline]
     pub(crate) fn read_u64_at_nonexec(&self, va: Va) -> Option<u64> {
-        let (flags, ptr, len, start) = self.entry_at(va)?;
-        if flags & FLAG_EXEC != 0 {
+        let e = self.entry_at(va)?;
+        if e.flags & FLAG_EXEC != 0 {
             return None;
         }
-        let offset = (va - start) as usize;
-        if offset + 8 > len {
-            return None;
-        }
-        // Safety: ptr..ptr+len is valid for the lifetime of the backing store
-        // (mmap or _bss_bufs), which outlives this index (built within run()).
-        let bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), 8) };
+        let offset = (va - e.start) as usize;
+        let bytes = e.data.get(offset..offset + 8)?;
         Some(u64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     /// Returns the flags byte for the segment covering `va`, or `None` if unmapped.
     #[inline]
     pub(crate) fn flags_at(&self, va: Va) -> Option<u8> {
-        self.entry_at(va).map(|(f, _, _, _)| f)
+        self.entry_at(va).map(|e| e.flags)
     }
 
     /// Read a little-endian `i32` at `va` in any mapped segment.
@@ -225,13 +214,9 @@ impl SegmentDataIndex {
     /// tables may reside in `.rodata` (non-exec) or, rarely, inline in `.text`.
     #[inline]
     pub(crate) fn read_i32_at(&self, va: Va) -> Option<i32> {
-        let (_, ptr, len, start) = self.entry_at(va)?;
-        let offset = (va - start) as usize;
-        if offset + 4 > len {
-            return None;
-        }
-        // Safety: same invariant as read_u64_at_nonexec — backing store outlives this index.
-        let bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), 4) };
+        let e = self.entry_at(va)?;
+        let offset = (va - e.start) as usize;
+        let bytes = e.data.get(offset..offset + 4)?;
         Some(i32::from_le_bytes(bytes.try_into().unwrap()))
     }
 }

@@ -712,6 +712,37 @@ fn build_elf_got_slots(elf: &goblin::elf::Elf, pie_base: u64) -> HashSet<Va> {
         .collect()
 }
 
+/// O(log n) segment membership check for relocation pointer builders.
+///
+/// Builds a sorted, disjoint interval table from the segments and uses
+/// binary search (`partition_point`) to test membership — matching the
+/// strategy used by `SegmentIndex` in `arch::mod`.
+struct VaRangeSet {
+    /// Sorted by start VA; assumed disjoint (same invariant as SegmentIndex).
+    ranges: Vec<(u64, u64)>,
+}
+
+impl VaRangeSet {
+    fn build(segments: &[Segment]) -> Self {
+        let mut ranges: Vec<(u64, u64)> = segments
+            .iter()
+            .map(|s| (s.va.raw(), s.va.raw() + s.data.len() as u64))
+            .collect();
+        ranges.sort_unstable_by_key(|&(start, _)| start);
+        Self { ranges }
+    }
+
+    #[inline]
+    fn contains(&self, va: u64) -> bool {
+        let idx = self.ranges.partition_point(|&(start, _)| start <= va);
+        if idx == 0 {
+            return false;
+        }
+        let (start, end) = self.ranges[idx - 1];
+        va >= start && va < end
+    }
+}
+
 /// Extract relocation-derived pointer pairs `(from_va, to_va)` from ELF
 /// relocation tables (`.rela.dyn` / `.rel.dyn`).
 ///
@@ -735,16 +766,7 @@ fn build_elf_reloc_pointers(
     const R_AARCH64_RELATIVE: u32 = 1027;
     const R_AARCH64_ABS64: u32 = 257;
 
-    // Quick segment membership check: build sorted (start, end) intervals.
-    let seg_ranges: Vec<(u64, u64)> = segments
-        .iter()
-        .map(|s| (s.va.raw(), s.va.raw() + s.data.len() as u64))
-        .collect();
-    let in_segment = |va: u64| -> bool {
-        seg_ranges
-            .iter()
-            .any(|&(start, end)| va >= start && va < end)
-    };
+    let seg_set = VaRangeSet::build(segments);
 
     let mut result = Vec::new();
 
@@ -755,7 +777,7 @@ fn build_elf_reloc_pointers(
         if r_type == R_X86_64_RELATIVE || r_type == R_AARCH64_RELATIVE {
             // RELATIVE: target = pie_base + addend (no symbol lookup).
             let target = (rel.r_addend.unwrap_or(0) as u64).wrapping_add(pie_base);
-            if in_segment(target) {
+            if seg_set.contains(target) {
                 result.push((Va(from), Va(target)));
             }
         } else if r_type == R_X86_64_64 || r_type == R_AARCH64_ABS64 {
@@ -768,7 +790,7 @@ fn build_elf_reloc_pointers(
                             .st_value
                             .wrapping_add(pie_base)
                             .wrapping_add(rel.r_addend.unwrap_or(0) as u64);
-                        if in_segment(target) {
+                        if seg_set.contains(target) {
                             result.push((Va(from), Va(target)));
                         }
                     }
@@ -1025,46 +1047,63 @@ fn parse_pe(
 /// entry (type 10) identifies a 64-bit pointer slot. We read the pointer value
 /// from the file and emit `(slot_va, pointer_value)` when the pointer falls
 /// within a mapped segment.
+/// Sorted RVA→file-offset map for O(log n) reads from PE sections.
+struct PeSectionMap {
+    /// (sec_rva, sec_end_rva, sec_raw_offset, sec_raw_size) sorted by rva.
+    entries: Vec<(u32, u32, usize, usize)>,
+}
+
+impl PeSectionMap {
+    fn build(pe: &goblin::pe::PE) -> Self {
+        let mut entries: Vec<(u32, u32, usize, usize)> = pe
+            .sections
+            .iter()
+            .filter(|s| s.size_of_raw_data > 0)
+            .map(|s| {
+                (
+                    s.virtual_address,
+                    s.virtual_address + s.virtual_size,
+                    s.pointer_to_raw_data as usize,
+                    s.size_of_raw_data as usize,
+                )
+            })
+            .collect();
+        entries.sort_unstable_by_key(|e| e.0);
+        Self { entries }
+    }
+
+    /// Resolve an RVA to a file offset, or `None` if out of range.
+    fn rva_to_file_offset(&self, rva: u32) -> Option<usize> {
+        let idx = self.entries.partition_point(|e| e.0 <= rva);
+        if idx == 0 {
+            return None;
+        }
+        let (sec_rva, sec_end, sec_raw_off, sec_raw_size) = self.entries[idx - 1];
+        if rva >= sec_rva && rva < sec_end {
+            let offset_in_sec = (rva - sec_rva) as usize;
+            if offset_in_sec < sec_raw_size {
+                return Some(sec_raw_off + offset_in_sec);
+            }
+        }
+        None
+    }
+
+    /// Read a little-endian u64 from the file at the given RVA.
+    fn read_u64_at_rva(&self, bytes: &[u8], rva: u32) -> Option<u64> {
+        let off = self.rva_to_file_offset(rva)?;
+        let slice = bytes.get(off..off + 8)?;
+        Some(u64::from_le_bytes(slice.try_into().unwrap()))
+    }
+}
+
 fn build_pe_reloc_pointers(
     bytes: &[u8],
     pe: &goblin::pe::PE,
     image_base: u64,
     segments: &[Segment],
 ) -> Vec<(Va, Va)> {
-    // Quick segment membership check.
-    let seg_ranges: Vec<(u64, u64)> = segments
-        .iter()
-        .map(|s| (s.va.raw(), s.va.raw() + s.data.len() as u64))
-        .collect();
-    let in_segment = |va: u64| -> bool {
-        seg_ranges
-            .iter()
-            .any(|&(start, end)| va >= start && va < end)
-    };
-
-    // Helper: read a 64-bit pointer from the file at a given RVA.
-    let read_ptr_at_rva = |rva: u32| -> Option<u64> {
-        for section in &pe.sections {
-            let sec_rva = section.virtual_address;
-            let sec_vsize = section.virtual_size;
-            let sec_raw_offset = section.pointer_to_raw_data as usize;
-            let sec_raw_size = section.size_of_raw_data as usize;
-            if rva >= sec_rva && rva < sec_rva + sec_vsize {
-                let offset_in_sec = (rva - sec_rva) as usize;
-                if offset_in_sec + 8 > sec_raw_size {
-                    return None;
-                }
-                let file_off = sec_raw_offset + offset_in_sec;
-                if file_off + 8 > bytes.len() {
-                    return None;
-                }
-                return Some(u64::from_le_bytes(
-                    bytes[file_off..file_off + 8].try_into().unwrap(),
-                ));
-            }
-        }
-        None
-    };
+    let seg_set = VaRangeSet::build(segments);
+    let sec_map = PeSectionMap::build(pe);
 
     let mut result = Vec::new();
 
@@ -1082,22 +1121,9 @@ fn build_pe_reloc_pointers(
         });
 
     if let Some((dir_rva, dir_size)) = reloc_dir {
-        let reloc_rva = dir_rva as usize;
         let reloc_size = dir_size as usize;
 
-        // Find the file offset for the reloc table.
-        let mut reloc_file_off = None;
-        for section in &pe.sections {
-            let sec_rva = section.virtual_address as usize;
-            let sec_vsize = section.virtual_size as usize;
-            if reloc_rva >= sec_rva && reloc_rva < sec_rva + sec_vsize {
-                let off_in_sec = reloc_rva - sec_rva;
-                reloc_file_off = Some(section.pointer_to_raw_data as usize + off_in_sec);
-                break;
-            }
-        }
-
-        if let Some(base_off) = reloc_file_off {
+        if let Some(base_off) = sec_map.rva_to_file_offset(dir_rva) {
             let reloc_bytes = bytes.get(base_off..base_off + reloc_size).unwrap_or(&[]);
             let mut pos = 0usize;
             while pos + 8 <= reloc_bytes.len() {
@@ -1119,8 +1145,8 @@ fn build_pe_reloc_pointers(
                     if rel_type == IMAGE_REL_BASED_DIR64 {
                         let slot_rva = page_rva + offset as u32;
                         let slot_va = image_base + slot_rva as u64;
-                        if let Some(ptr_val) = read_ptr_at_rva(slot_rva) {
-                            if ptr_val != 0 && in_segment(ptr_val) {
+                        if let Some(ptr_val) = sec_map.read_u64_at_rva(bytes, slot_rva) {
+                            if ptr_val != 0 && seg_set.contains(ptr_val) {
                                 result.push((Va(slot_va), Va(ptr_val)));
                             }
                         }

@@ -533,24 +533,17 @@ fn update_cmp_state(insn: &Instruction, cmp_bound: &mut [Option<u32>; 16]) {
     }
 }
 
-/// Fallback table size limit when no CMP bound is available.
-/// Must be very small — without a known bound, random data in large code
-/// segments can produce many false-positive targets.
-const FALLBACK_TABLE_LIMIT: usize = 0;
-
-/// Read a jump table starting at `table_start`, emitting Jump xrefs from
+/// Read a jump table starting at `jt.table_start`, emitting Jump xrefs from
 /// `jmp_va` to each resolved target.
 ///
-/// Each entry is a signed 32-bit offset added to `target_base` to compute
+/// Each entry is a signed 32-bit offset added to `jt.target_base` to compute
 /// the jump target.
 ///
-/// Guards against false positives from dead-code zones:
-///   - When a CMP bound is available, the table size is known precisely and
-///     the table is trusted (may reside in any segment, including .text for PE).
-///   - When no CMP bound is known, the table must reside in a non-exec segment
-///     (.rodata) to prevent random bytes in dead code from producing fake tables,
-///     and the size is capped at a small fallback.
-///   - Always stops on the first entry that doesn't resolve to an exec address.
+/// Requires a CMP bound (`jt.max_entries`) to limit the read.  Without one
+/// the table size is unknown, and random data in dead-code zones would produce
+/// many false-positive targets.  Tables without a bound are silently skipped.
+///
+/// Also stops on the first entry that doesn't resolve to an executable address.
 fn recover_jump_table(
     jmp_va: Va,
     jt: JumpTableInfo,
@@ -558,19 +551,10 @@ fn recover_jump_table(
     seg_idx: &SegmentIndex,
     xrefs: &mut Vec<Xref>,
 ) {
-    let limit = match jt.max_entries {
-        Some(n) => (n as usize).min(MAX_JUMP_TABLE_ENTRIES),
-        None => {
-            // Without a CMP bound, require data in a non-exec segment.
-            // Dead-code LEA+MOVSXD+ADD+JMP patterns in .text would reference
-            // .text data that looks like valid offsets, producing many FPs.
-            let flags = data_idx.flags_at(jt.table_start);
-            if flags.is_none_or(|f| f & super::FLAG_EXEC != 0) {
-                return;
-            }
-            FALLBACK_TABLE_LIMIT
-        }
+    let Some(max) = jt.max_entries else {
+        return; // no CMP bound — skip to avoid FP explosion in dead zones
     };
+    let limit = (max as usize).min(MAX_JUMP_TABLE_ENTRIES);
     for i in 0..limit {
         let slot_va = jt.table_start + (i as u64) * 4;
         let Some(offset) = data_idx.read_i32_at(slot_va) else {

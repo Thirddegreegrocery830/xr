@@ -444,7 +444,7 @@ impl<'a> XrefPass<'a> {
 /// `too_many_arguments` limit (7).
 struct ScanCtx<'a> {
     seg_idx: &'a SegmentIndex,
-    data_idx: &'a SegmentDataIndex,
+    data_idx: &'a SegmentDataIndex<'a>,
     /// Known GOT slot VAs (from `LoadedBinary::got_slots`).
     got_slots: &'a std::collections::HashSet<Va>,
 }
