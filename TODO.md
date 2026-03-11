@@ -78,8 +78,12 @@
 
 ## Investigate
 
-- [ ] ARM64 recall regressed significantly at some point (possibly before or after
+- [x] ARM64 recall regressed significantly at some point (possibly before or after
   repo history was squashed). STATUS.md records curl-aarch64 overall F1=0.944
   (rec=0.907) but current code produces F1=0.866 (rec=0.771). data_read collapsed
   from F1=0.906 to 0.042, data_write from 0.541 to 0.290, data_ptr from 0.813 to
   0.518. Call and jump are roughly unchanged. Need to bisect and fix.
+  **Root cause**: LDR handler cleared `adrp_state[rt]` before reading
+  `adrp_state[rn]`. When Rt==Rn (24% of LDRs: `ADRP X0, page; LDR X0, [X0, #off]`)
+  the ADRP state was destroyed before pair resolution. Fix: snapshot base state first.
+  Result: overall F1 0.866→0.943, data_read F1 0.042→0.894, data_ptr F1 0.518→0.815.

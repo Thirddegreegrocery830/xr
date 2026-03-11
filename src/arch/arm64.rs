@@ -183,79 +183,81 @@ pub(crate) fn scan_adrp(
                 //
                 // Register invalidation: LDR always writes its destination register with
                 // an unknown value when the memory operand can't be resolved via ADRP state.
-                // Stale ADRP state must be cleared unconditionally so a subsequent BLR/BR
-                // doesn't use it to emit a wrong xref. We do this below regardless of
-                // whether resolve_mem_ref succeeds.
+                // Stale ADRP state must be cleared so a subsequent BLR/BR doesn't use it
+                // to emit a wrong xref.
+                //
+                // IMPORTANT: we must read adrp_state[rn] BEFORE clearing adrp_state[rt],
+                // because Rt == Rn is common (e.g. `ADRP X0, page; LDR X0, [X0, #off]`).
+                // Clearing Rt first would destroy the base register's ADRP state.
 
-                // Always clear the destination register's ADRP state — LDR overwrites it.
-                // (Refined to the loaded value inside the resolved branch below.)
                 let rt = insn.rd() as usize;
+                let rn = insn.rn() as usize;
+
+                // Snapshot the base register's ADRP state before any invalidation.
+                let base_state = if rn < 31 { adrp_state[rn] } else { None };
+
+                // Clear Rt — LDR overwrites the destination register.
+                // (Refined to the loaded value inside the resolved branch below.)
                 if rt < 31 {
                     adrp_state[rt] = None;
                 }
 
-                let rn = insn.rn() as usize;
-                if rn < 31 {
-                    if let Some((adrp_i, adrp_va, page, _chain)) = adrp_state[rn] {
-                        if i - adrp_i <= ADRP_WINDOW {
-                            let got_addr = page.wrapping_add(insn.ldr_str_offset());
-                            let got_is_exec = idx.is_exec(Va(got_addr));
+                if let Some((adrp_i, adrp_va, page, _chain)) = base_state {
+                    if i - adrp_i <= ADRP_WINDOW {
+                        let got_addr = page.wrapping_add(insn.ldr_str_offset());
+                        let got_is_exec = idx.is_exec(Va(got_addr));
 
-                            // ADRP → data_ptr to GOT address (matching IDA's data_ptr at ADRP)
-                            if idx.contains(Va(got_addr)) {
-                                xrefs.push(Xref {
-                                    from: Va(adrp_va),
-                                    to: Va(got_addr),
-                                    kind: XrefKind::DataPointer,
-                                    confidence: Confidence::PairResolved,
-                                });
-                            }
+                        // ADRP → data_ptr to GOT address (matching IDA's data_ptr at ADRP)
+                        if idx.contains(Va(got_addr)) {
+                            xrefs.push(Xref {
+                                from: Va(adrp_va),
+                                to: Va(got_addr),
+                                kind: XrefKind::DataPointer,
+                                confidence: Confidence::PairResolved,
+                            });
+                        }
 
-                            if idx.contains(Va(got_addr)) {
-                                // data_read at LDR_va → resolved address (IDA dr_R).
-                                // IDA records this even for exec-segment targets (e.g. jump tables,
-                                // zero-init data regions embedded in .text), so no exec suppression.
-                                xrefs.push(Xref {
-                                    from: Va(va),
-                                    to: Va(got_addr),
-                                    kind: XrefKind::DataRead,
-                                    confidence: Confidence::PairResolved,
-                                });
-                            }
+                        if idx.contains(Va(got_addr)) {
+                            // data_read at LDR_va → resolved address (IDA dr_R).
+                            // IDA records this even for exec-segment targets (e.g. jump tables,
+                            // zero-init data regions embedded in .text), so no exec suppression.
+                            xrefs.push(Xref {
+                                from: Va(va),
+                                to: Va(got_addr),
+                                kind: XrefKind::DataRead,
+                                confidence: Confidence::PairResolved,
+                            });
+                        }
 
-                            // Read the stored value at got_addr (pointer-follow) — only for
-                            // non-exec targets since exec regions don't hold valid data pointers.
-                            // Uses SegmentDataIndex for O(log n) lookup instead of a linear scan.
-                            let stored_val: Option<u64> = if !got_is_exec {
-                                data_idx
-                                    .read_u64_at_nonexec(Va(got_addr))
-                                    .filter(|&v| v != 0 && idx.contains(Va(v)))
-                            } else {
-                                None
-                            };
+                        // Read the stored value at got_addr (pointer-follow) — only for
+                        // non-exec targets since exec regions don't hold valid data pointers.
+                        // Uses SegmentDataIndex for O(log n) lookup instead of a linear scan.
+                        let stored_val: Option<u64> = if !got_is_exec {
+                            data_idx
+                                .read_u64_at_nonexec(Va(got_addr))
+                                .filter(|&v| v != 0 && idx.contains(Va(v)))
+                        } else {
+                            None
+                        };
 
-                            // Pointer-follow: emit data_ptr at LDR_va → loaded function/data pointer.
-                            if let Some(v) = stored_val {
-                                xrefs.push(Xref {
-                                    from: Va(va),
-                                    to: Va(v),
-                                    kind: XrefKind::DataPointer,
-                                    confidence: Confidence::PairResolved,
-                                });
-                            }
+                        // Pointer-follow: emit data_ptr at LDR_va → loaded function/data pointer.
+                        if let Some(v) = stored_val {
+                            xrefs.push(Xref {
+                                from: Va(va),
+                                to: Va(v),
+                                kind: XrefKind::DataPointer,
+                                confidence: Confidence::PairResolved,
+                            });
+                        }
 
-                            // Propagate the loaded value into ADRP state for the destination
-                            // register so chained LDRs can be resolved:
-                            //   ADRP X24, page → LDR X24, [X24, #off] → LDR X8, [X24, #0]
-                            // The second LDR uses the VALUE loaded by the first as its base.
-                            //
-                            // Note: when stored_val is None, the destination was already cleared
-                            // unconditionally before the resolve check above.
-                            if let Some(v) = stored_val {
-                                if rt < 31 {
-                                    // Internal pointer-follow: chain=true (not callable directly)
-                                    adrp_state[rt] = Some((i, va, v, true));
-                                }
+                        // Propagate the loaded value into ADRP state for the destination
+                        // register so chained LDRs can be resolved:
+                        //   ADRP X24, page → LDR X24, [X24, #off] → LDR X8, [X24, #0]
+                        // The second LDR uses the VALUE loaded by the first as its base.
+                        if let Some(v) = stored_val {
+                            if rt < 31 {
+                                // Internal pointer-follow: chain=true (not callable directly)
+                                adrp_state[rt] = Some((i, va, v, true));
                             }
                         }
                     }
@@ -568,6 +570,58 @@ mod tests {
         assert_eq!(pair.from, Va(0x1000)); // ADRP va (IDA records at ADRP, not ADD)
         assert_eq!(pair.to, Va(0x2100)); // 0x2000 + 0x100
         assert_eq!(pair.kind, XrefKind::DataPointer);
+    }
+
+    // ── ADRP + LDR with Rt == Rn (regression test) ──────────────────────────
+
+    /// ADRP X0, page → LDR X0, [X0, #8]  (Rt == Rn == 0)
+    /// This is the most common ADRP+LDR pattern. The LDR handler must snapshot
+    /// the base register's ADRP state BEFORE clearing the destination register,
+    /// or the pair is silently dropped (regression: data_read F1 0.906 → 0.042).
+    #[test]
+    fn test_adrp_ldr_same_register() {
+        // ADRP X0, #1  → page = 0x2000 (from pc 0x1000)
+        // LDR  X0, [X0, #8]  → addr = 0x2000 + 8 = 0x2008
+        //
+        // ADRP X0, #1: encoded as 0xB000_0000 (immlo=1 → +1 page, Rd=0)
+        // LDR  X0, [X0, #8]: unsigned offset, imm12 = 8/8 = 1
+        //   word = 0xF940_0400 | Rn=0<<5 | Rt=0 = 0xF940_0400
+        static CODE: [u8; 8] = [
+            0x00, 0x00, 0x00, 0xb0, // ADRP X0, #1 page
+            0x00, 0x04, 0x40, 0xf9, // LDR X0, [X0, #8]
+        ];
+        // Data segment at 0x2000 so target 0x2008 is valid.
+        static DATA: [u8; 0x100] = [0u8; 0x100];
+        let code_seg = fake_seg(0x1000, &CODE);
+        let segs = vec![fake_seg(0x1000, &CODE), Segment {
+            va: Va(0x2000),
+            data: &DATA,
+            executable: false,
+            readable: true,
+            writable: false,
+            byte_scannable: false,
+            mode: DecodeMode::Default,
+            name: "data".to_string(),
+        }];
+
+        let idx = SegmentIndex::build(&segs);
+        let didx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_adrp(&region_for(&code_seg), &idx, &didx);
+
+        // Must emit data_read at LDR VA (0x1004) → 0x2008
+        let dr = xrefs
+            .iter()
+            .find(|x| x.kind == XrefKind::DataRead)
+            .expect("ADRP+LDR with Rt==Rn must emit data_read (regression: state cleared before read)");
+        assert_eq!(dr.from, Va(0x1004));
+        assert_eq!(dr.to, Va(0x2008));
+
+        // Must also emit data_ptr at ADRP VA (0x1000) → 0x2008
+        let dp = xrefs
+            .iter()
+            .find(|x| x.kind == XrefKind::DataPointer && x.from == Va(0x1000))
+            .expect("ADRP+LDR must emit data_ptr at ADRP VA");
+        assert_eq!(dp.to, Va(0x2008));
     }
 
     // ── Target outside all segments → no xref ────────────────────────────────
