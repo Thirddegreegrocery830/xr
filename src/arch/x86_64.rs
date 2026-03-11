@@ -17,8 +17,7 @@ use iced_x86::{
     Code, Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, OpAccess,
     OpKind, Register,
 };
-use std::collections::HashMap;
-
+use std::collections::HashSet;
 /// Returns true if the memory operand at `op_idx` in `insn` is written to (not just read).
 /// Uses InstructionInfoFactory for accurate semantics (handles CMP, TEST, ADD [mem], etc.).
 #[inline]
@@ -41,9 +40,9 @@ fn mem_op_is_write(
 pub(crate) fn scan_linear(
     region: &ScanRegion,
     idx: &SegmentIndex,
-    got_map: &HashMap<Va, Va>,
+    got_slots: &HashSet<Va>,
 ) -> XrefSet {
-    scan_with_prop(region, idx, got_map)
+    scan_with_prop(region, idx, got_slots)
 }
 
 /// Depth 2: linear disassembly + simple register constant propagation.
@@ -51,7 +50,7 @@ pub(crate) fn scan_linear(
 pub(crate) fn scan_with_prop(
     region: &ScanRegion,
     idx: &SegmentIndex,
-    got_map: &HashMap<Va, Va>,
+    got_slots: &HashSet<Va>,
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
@@ -76,7 +75,7 @@ pub(crate) fn scan_with_prop(
 
         // Depth-1 branch/call xrefs — only from executable regions.
         if region_is_exec {
-            emit_direct_branches(&insn, va, idx, got_map, &mut xrefs);
+            emit_direct_branches(&insn, va, idx, got_slots, &mut xrefs);
         }
 
         emit_rip_relative(&insn, va, idx, &mut info_factory, &mut xrefs);
@@ -144,14 +143,14 @@ pub(crate) fn scan_with_prop(
 ///   JMP rel32            → `Jump`  (FlowControl::UnconditionalBranch)
 ///   Jcc rel32/rel8       → `CondJump` (FlowControl::ConditionalBranch)
 ///   XBEGIN rel32         → `CondJump` (FlowControl::XbeginXabortXend)
-///   CALL [RIP+disp32] }  → resolved via got_map → `Call`/`Jump` to extern VA
+///   CALL [RIP+disp32] }  → `Call`/`Jump` to GOT slot VA
 ///   JMP  [RIP+disp32] }  (FlowControl::IndirectCall / IndirectBranch, FF 15 / FF 25)
 #[inline]
 fn emit_direct_branches(
     insn: &Instruction,
     va: u64,
     idx: &SegmentIndex,
-    got_map: &HashMap<Va, Va>,
+    got_slots: &HashSet<Va>,
     xrefs: &mut Vec<Xref>,
 ) {
     match insn.flow_control() {
@@ -184,27 +183,31 @@ fn emit_direct_branches(
                 }
             }
         }
-        // Indirect call/jump through GOT (FF 15 / FF 25): resolve via got_map.
-        // If the memory operand is [RIP+disp32] and the GOT slot is in got_map,
-        // emit a Call or Jump xref to the extern VA.
+        // Indirect call/jump through GOT (FF 15 / FF 25): emit xref to the
+        // GOT slot VA itself. The benchmark normalizes IDA's extern VAs back
+        // to GOT slot VAs so both sides match on (from, got_slot_va).
         FlowControl::IndirectCall | FlowControl::IndirectBranch => {
-            emit_got_indirect(insn, va, got_map, xrefs);
+            emit_got_indirect(insn, va, got_slots, xrefs);
         }
         _ => {}
     }
 }
 
 /// Emit a Call or Jump xref for an indirect `CALL [RIP+disp32]` / `JMP [RIP+disp32]`
-/// instruction (FF 15 / FF 25) when the resolved GOT slot is in `got_map`.
+/// instruction (FF 15 / FF 25) when the target is a known GOT slot.
 ///
-/// IDA records these as xrefs to the synthetic extern VA assigned to the imported
-/// symbol.  We replicate this by looking up the GOT slot VA in `got_map` and
-/// emitting a `LinearImmediate` xref with the extern VA as the target.
+/// The target is the GOT slot VA itself (the address of the pointer the CPU
+/// dereferences at runtime).  The benchmark normalizes IDA's synthetic extern
+/// VAs back to GOT slot VAs so both sides agree on `(from, got_slot_va)`.
+///
+/// Only fires for slots in `got_slots` (populated from GLOB_DAT / JUMP_SLOT
+/// relocations) to avoid emitting spurious Call xrefs for non-GOT RIP-relative
+/// indirect calls (e.g., function pointer tables).
 #[inline]
 fn emit_got_indirect(
     insn: &Instruction,
     va: u64,
-    got_map: &HashMap<Va, Va>,
+    got_slots: &HashSet<Va>,
     xrefs: &mut Vec<Xref>,
 ) {
     // Only applies when the single memory operand uses RIP-relative addressing.
@@ -213,7 +216,7 @@ fn emit_got_indirect(
         && insn.memory_base() == Register::RIP
     {
         let got_slot_va = Va(insn.memory_displacement64());
-        if let Some(&extern_va) = got_map.get(&got_slot_va) {
+        if got_slots.contains(&got_slot_va) {
             let kind = if insn.flow_control() == FlowControl::IndirectCall {
                 XrefKind::Call
             } else {
@@ -221,7 +224,7 @@ fn emit_got_indirect(
             };
             xrefs.push(Xref {
                 from: Va(va),
-                to: extern_va,
+                to: got_slot_va,
                 kind,
                 confidence: Confidence::LinearImmediate,
             });
@@ -420,7 +423,6 @@ mod tests {
     use crate::arch::ScanRegion;
     use crate::loader::{DecodeMode, Segment};
     use crate::xref::{Confidence, XrefKind};
-    use std::collections::HashMap;
 
     fn fake_seg(va: u64, data: &'static [u8]) -> Segment {
         Segment {
@@ -451,7 +453,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].from, Va(0x1000));
         assert_eq!(xrefs[0].to, Va(0x2000));
@@ -474,7 +476,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
         let jmp = xrefs.iter().find(|x| x.kind == XrefKind::Jump).unwrap();
         assert_eq!(jmp.from, Va(0x1005));
         assert_eq!(jmp.to, Va(0x2000));
@@ -496,7 +498,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
         let je = xrefs.iter().find(|x| x.kind == XrefKind::CondJump).unwrap();
         assert_eq!(je.from, Va(0x100a));
         assert_eq!(je.to, Va(0x2000));
@@ -515,7 +517,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
         // LEA = takes address → DataPointer (IDA dr_O), not DataRead
         let lea = xrefs
             .iter()
@@ -542,7 +544,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_with_prop(&region_for(&code), &idx, &HashMap::new());
+        let xrefs = scan_with_prop(&region_for(&code), &idx, &HashSet::new());
         let prop = xrefs
             .iter()
             .find(|x| x.confidence == Confidence::LocalProp)
@@ -561,7 +563,7 @@ mod tests {
         let code = fake_seg(0x1000, &CODE);
         let segs = vec![fake_seg(0x1000, &CODE)];
         let idx = SegmentIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new());
         assert!(xrefs.is_empty());
     }
 }

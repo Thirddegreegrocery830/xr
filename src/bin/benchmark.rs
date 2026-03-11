@@ -32,7 +32,7 @@ use std::time::Instant;
 use xr::pass::PassConfig;
 use xr::va::Va;
 use xr::xref::{Xref, XrefKind};
-use xr::{Depth, LoadedBinary, XrefPass};
+use xr::{Arch, Depth, LoadedBinary, XrefPass};
 
 #[derive(Parser)]
 #[command(
@@ -224,6 +224,38 @@ fn run_pass(
     (last_xrefs, best_ms)
 }
 
+// ── GOT-indirect normalization ─────────────────────────────────────────────
+
+/// For x86-64: if the instruction at `from_va` is `CALL [RIP+disp32]` (FF 15)
+/// or `JMP [RIP+disp32]` (FF 25), return the GOT slot VA.  Otherwise `None`.
+fn resolve_x86_got_slot(binary: &LoadedBinary, from_va: Va) -> Option<Va> {
+    let seg = binary.segment_at(from_va)?;
+    let offset = (from_va.raw() - seg.va.raw()) as usize;
+    let bytes = seg.data().get(offset..offset + 6)?;
+    // FF 15 xx xx xx xx = CALL [RIP+disp32]
+    // FF 25 xx xx xx xx = JMP  [RIP+disp32]
+    if bytes[0] == 0xFF && (bytes[1] == 0x15 || bytes[1] == 0x25) {
+        let disp = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        let next_ip = from_va.raw() + 6;
+        let got_slot = next_ip.wrapping_add(disp as i64 as u64);
+        Some(Va(got_slot))
+    } else {
+        None
+    }
+}
+
+/// Compute the "extern bound": the highest VA at the end of any mapped segment.
+/// Any IDA `to` address at or above this is a synthetic extern VA (not a real
+/// address in the binary).
+fn extern_bound(binary: &LoadedBinary) -> u64 {
+    binary
+        .segments
+        .iter()
+        .map(|s| s.va.raw() + s.data().len() as u64)
+        .max()
+        .unwrap_or(u64::MAX)
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -258,7 +290,18 @@ fn main() -> Result<()> {
         0
     };
 
-    // Build IDA sets per kind and overall
+    // Build IDA sets per kind and overall.
+    //
+    // GOT-indirect normalization (x86-64 ELF only):
+    // IDA records `CALL [RIP+disp32]` / `JMP [RIP+disp32]` as xrefs to a
+    // synthetic "extern VA" that IDA assigns to the imported symbol.  xr emits
+    // these as xrefs to the GOT slot VA (the real address the CPU dereferences).
+    // To make them comparable, we decode the instruction at each IDA xref's
+    // `from` address: if it's an FF 15/FF 25 GOT-indirect, we replace IDA's
+    // extern VA target with the GOT slot VA computed from the instruction bytes.
+    let ext_bound = extern_bound(&binary);
+    let mut extern_normalized = 0u64;
+
     let mut ida_by_kind: HashMap<XrefKind, HashSet<AddrPair>> = HashMap::new();
     let mut ida_all: HashSet<AddrPair> = HashSet::new();
     for &k in XrefKind::SCORED_KINDS {
@@ -266,13 +309,33 @@ fn main() -> Result<()> {
     }
 
     for x in ida_raw {
-        let pair = (Va(x.from.wrapping_add(va_offset)), Va(x.to.wrapping_add(va_offset)));
+        let from = Va(x.from.wrapping_add(va_offset));
+        let mut to = Va(x.to.wrapping_add(va_offset));
+
+        // Normalize IDA extern-target call/jump xrefs to GOT slot VAs.
+        if to.raw() >= ext_bound
+            && (x.kind == "call" || x.kind == "jump")
+            && binary.arch == Arch::X86_64
+        {
+            if let Some(got_va) = resolve_x86_got_slot(&binary, from) {
+                to = got_va;
+                extern_normalized += 1;
+            }
+        }
+
+        let pair = (from, to);
         ida_all.insert(pair);
         if let Some(kind) = XrefKind::from_name(&x.kind) {
             if let Some(set) = ida_by_kind.get_mut(&kind) {
                 set.insert(pair);
             }
         }
+    }
+
+    if extern_normalized > 0 {
+        println!(
+            "GOT normalize: {extern_normalized} IDA extern-target xrefs → GOT slot VAs"
+        );
     }
 
     if va_offset != 0 {

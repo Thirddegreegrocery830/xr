@@ -4,7 +4,7 @@ Three independent workstreams. Each can be implemented and tested in isolation.
 
 ---
 
-## 1. Fix GOT-indirect call/jump resolution
+## 1. Fix GOT-indirect call/jump resolution ✅ DONE
 
 ### Problem
 
@@ -354,7 +354,32 @@ from local analysis of the instruction sequence, not from a full CFG.
 
 ## Priority order
 
-1. **GOT fix** — pure bugfix, highest F1 impact per line of code changed
+1. ~~**GOT fix** — pure bugfix, highest F1 impact per line of code changed~~ ✅ DONE
 2. **Reloc data_ptr** — biggest FN category (75%), moderate implementation
    effort
 3. **Jump tables** — meaningful FN reduction, most implementation effort
+
+---
+
+## Results after workstream 1
+
+Implementation: deleted `build_elf_got_map` and `got_map: HashMap<Va,Va>`.
+Replaced with `got_slots: HashSet<Va>` (just the set of GOT slot VAs from
+GLOB_DAT/JUMP_SLOT relocs). `emit_got_indirect` now emits `to=got_slot_va`
+instead of `to=extern_va`, gated by `got_slots.contains()`. Benchmark
+normalizes IDA extern-target xrefs by decoding the instruction at `from` to
+recover the GOT slot VA (raw FF 15/FF 25 byte matching).
+
+Key results (Paired depth, call metrics):
+
+| Binary                | call prec | call rec | call F1 | GOT normalized |
+|-----------------------|-----------|----------|---------|----------------|
+| blackcat.elf          | 0.995     | 0.934    | 0.964   | 5453           |
+| hello-linux-gcc       | 1.000     | 0.478    | 0.647   | 288            |
+| curl-amd64            | 0.999     | 0.999    | 0.999   | —              |
+| libssl3-amd64.so.3    | 1.000     | 0.999    | 1.000   | 503            |
+| libharlem-shake.so    | 0.948     | 0.921    | 0.934   | 4801           |
+| libcurl-x86.so        | 1.000     | 0.999    | 1.000   | 326            |
+| libpjsip-everything   | 1.000     | 0.994    | 0.997   | 200            |
+
+No regressions on any of the 20 test binaries.

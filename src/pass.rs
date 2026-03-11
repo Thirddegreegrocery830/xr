@@ -285,7 +285,7 @@ impl<'a> XrefPass<'a> {
         let ctx = ScanCtx {
             seg_idx: &seg_idx,
             data_idx: &data_idx,
-            got_map: &self.binary.got_map,
+            got_slots: &self.binary.got_slots,
         };
 
         // Cancellation flag: set by the drain thread when on_batch returns Break.
@@ -419,8 +419,8 @@ impl<'a> XrefPass<'a> {
 struct ScanCtx<'a> {
     seg_idx: &'a SegmentIndex,
     data_idx: &'a SegmentDataIndex,
-    /// GOT slot VA → extern VA (from `LoadedBinary::got_map`).
-    got_map: &'a std::collections::HashMap<Va, Va>,
+    /// Known GOT slot VAs (from `LoadedBinary::got_slots`).
+    got_slots: &'a std::collections::HashSet<Va>,
 }
 
 fn scan_shard(
@@ -449,10 +449,10 @@ fn scan_shard(
         }
         // x86-64
         (Arch::X86_64, _, Depth::Linear) => {
-            x86_64::scan_linear(&region, ctx.seg_idx, ctx.got_map)
+            x86_64::scan_linear(&region, ctx.seg_idx, ctx.got_slots)
         }
         (Arch::X86_64, _, Depth::Paired) => {
-            x86_64::scan_with_prop(&region, ctx.seg_idx, ctx.got_map)
+            x86_64::scan_with_prop(&region, ctx.seg_idx, ctx.got_slots)
         }
         // x86 32-bit — stub
         (Arch::X86, _, _) => {

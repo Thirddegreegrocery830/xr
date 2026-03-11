@@ -4,17 +4,13 @@ use dylex::DyldContext;
 use goblin::Object;
 use memmap2::Mmap;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 
 /// Default PIE base for ET_DYN ELF binaries whose lowest PT_LOAD has `p_vaddr == 0`.
 /// Matches the traditional Linux x86-64 / AArch64 PIE base and IDA default.
 const DEFAULT_PIE_BASE: u64 = 0x0040_0000;
-
-/// Alignment padding added after the highest PT_LOAD end when computing
-/// the base VA for synthetic external-function segments.
-const EXTERN_BASE_PAD: u64 = 0x20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
@@ -109,15 +105,13 @@ pub struct LoadedBinary {
     /// All segment VAs, entry points, and symbols have already had this
     /// value added. 0 for non-PIE binaries and non-ELF formats.
     pub pie_base: u64,
-    /// GOT slot VA → extern VA mapping.
+    /// Set of GOT slot VAs (from GLOB_DAT / JUMP_SLOT relocations).
     ///
-    /// Maps rebased GOT slot VAs to the synthetic "extern segment" VAs that IDA
-    /// assigns to undefined symbols, so indirect `CALL [RIP+got_slot]` (FF 15)
-    /// and `JMP [RIP+got_slot]` (FF 25) xrefs can be emitted with correct targets.
-    ///
-    /// Populated by `build_elf_got_map` for ELF PIE binaries.  Empty for Mach-O,
-    /// PE, and non-PIE ELF (where GOT-indirect calls target resolved addresses).
-    pub got_map: HashMap<Va, Va>,
+    /// Used by the x86-64 scanner to restrict `CALL [RIP+disp32]` /
+    /// `JMP [RIP+disp32]` xref emission to actual import-GOT slots
+    /// (vs arbitrary RIP-relative indirect calls through non-GOT pointers).
+    /// Populated for ELF binaries; empty for Mach-O and PE.
+    pub got_slots: HashSet<Va>,
     /// The underlying mmap — kept alive here.
     _mmap: Mmap,
     /// Zero-filled BSS buffers allocated by the loader.
@@ -165,7 +159,7 @@ impl LoadedBinary {
                 entry_points: p.entry_points,
                 symbols: p.symbols,
                 pie_base: p.pie_base,
-                got_map: p.got_map,
+                got_slots: p.got_slots,
                 _mmap: mmap,
                 _bss_bufs: vec![],
                 _dyld_ctx: Some(Box::new(result.dyld_ctx)),
@@ -187,7 +181,7 @@ impl LoadedBinary {
             entry_points: p.entry_points,
             symbols: p.symbols,
             pie_base: p.pie_base,
-            got_map: p.got_map,
+            got_slots: p.got_slots,
             _mmap: mmap,
             _bss_bufs: bss_bufs,
             _dyld_ctx: None,
@@ -208,7 +202,7 @@ impl LoadedBinary {
             entry_points: vec![],
             symbols: vec![],
             pie_base: 0,
-            got_map: HashMap::new(),
+            got_slots: HashSet::new(),
             _mmap: mmap,
             _bss_bufs: vec![],
             _dyld_ctx: None,
@@ -267,9 +261,8 @@ struct ParseResult {
     symbols: Vec<(String, Va)>,
     /// Non-zero only for PIE ELF binaries rebased by `parse_elf`.
     pie_base: u64,
-    /// GOT slot VA → extern VA. Populated by `build_elf_got_map` for PIE ELF;
-    /// empty for other formats.
-    got_map: HashMap<Va, Va>,
+    /// GOT slot VAs from GLOB_DAT / JUMP_SLOT relocs. Empty for non-ELF.
+    got_slots: HashSet<Va>,
 }
 
 /// Allocate a zero-filled buffer of `size` bytes, store it in `bufs` for
@@ -318,7 +311,7 @@ fn parse_binary(
                 entry_points: vec![Va::ZERO],
                 symbols: vec![],
                 pie_base: 0,
-                got_map: HashMap::new(),
+                got_slots: HashSet::new(),
             })
         }
         _ => Err(anyhow!("unsupported binary format")),
@@ -401,7 +394,7 @@ fn parse_dyld_cache(path: &Path) -> Result<DyldParseResult> {
             entry_points: vec![],
             symbols: vec![],
             pie_base: 0,
-            got_map: HashMap::new(),
+            got_slots: HashSet::new(),
         },
         dyld_ctx: ctx,
     })
@@ -671,94 +664,17 @@ fn parse_elf(
     //   (STT_TLS excluded; all others included even without GLOB_DAT/JUMP_SLOT relocs)
     //   extern_va[i] = extern_base + i * 8
     //   Map: got_slot_va = r_offset+pie_base → extern_va for each GLOB_DAT/JUMP_SLOT reloc
-    let got_map = build_elf_got_map(elf, pie_base);
+    let got_slots = build_elf_got_slots(elf, pie_base);
 
-    Ok(ParseResult { arch, segments, entry_points, symbols, pie_base, got_map })
+    Ok(ParseResult { arch, segments, entry_points, symbols, pie_base, got_slots })
 }
 
-/// Build the GOT slot → extern VA mapping for an ELF binary.
+/// Collect the set of GOT slot VAs from GLOB_DAT / JUMP_SLOT relocations.
 ///
-/// IDA assigns synthetic "extern segment" VAs to imported symbols in this order
-/// (verified empirically against IDA ground truth, 0 mismatches on libharlem-shake.so):
-///
-///   extern_base = max(PT_LOAD p_vaddr + p_memsz) + pie_base + 0x20
-///
-///   Collect ALL SHN_UNDEF symbols from .dynsym EXCEPT STT_TLS symbols.
-///   Sort them: STT_FUNC symbols first (by dynsym index), then all others (by dynsym index).
-///   Assign: extern_va[i] = extern_base + i * 8
-///
-///   For each SHN_UNDEF symbol that also has a GLOB_DAT / JUMP_SLOT relocation,
-///   record got_slot_va → extern_va in the map.
-///
-/// Key properties:
-/// - IDA includes SHN_UNDEF symbols regardless of whether they have a GOT reloc
-///   (i.e., SHN_UNDEF symbols with only R_X86_64_64 / COPY / TPOFF relocs still
-///   consume an extern segment slot and shift the indices of all following symbols).
-/// - STT_TLS symbols are excluded from the extern segment.
-/// - The GOT VA ordering used by build_got_map in prior sessions was wrong because
-///   it ignored SHN_UNDEF symbols without GLOB_DAT/JUMP_SLOT relocs.
-fn build_elf_got_map(elf: &goblin::elf::Elf, pie_base: u64) -> HashMap<Va, Va> {
-    use goblin::elf::program_header::PT_LOAD;
-    use goblin::elf::section_header::SHN_UNDEF;
-    use goblin::elf::sym::{STT_FUNC, STT_TLS};
-
-    // extern_base: one slot above the highest PT_LOAD end, plus 0x20 alignment pad.
-    let extern_base = elf
-        .program_headers
-        .iter()
-        .filter(|ph| ph.p_type == PT_LOAD)
-        .map(|ph| ph.p_vaddr + ph.p_memsz)
-        .max()
-        .unwrap_or(0)
-        + pie_base
-        + EXTERN_BASE_PAD;
-
-    // Collect all SHN_UNDEF, non-STT_TLS symbols from .dynsym, by dynsym index.
-    // We need the dynsym index (position in .dynsym) as the sort key.
-    let mut func_syms: Vec<u32> = Vec::new(); // STT_FUNC SHN_UNDEF sym indices
-    let mut other_syms: Vec<u32> = Vec::new(); // other SHN_UNDEF sym indices
-
-    for (i, sym) in elf.dynsyms.iter().enumerate() {
-        if sym.st_shndx != SHN_UNDEF as usize {
-            continue;
-        }
-        if sym.st_type() == STT_TLS {
-            continue;
-        }
-        // Skip the null symbol (index 0 in .dynsym always has an empty name).
-        // IDA does not include it in the extern segment.
-        if elf
-            .dynstrtab
-            .get_at(sym.st_name)
-            .is_none_or(|n| n.is_empty())
-        {
-            continue;
-        }
-        if sym.st_type() == STT_FUNC {
-            func_syms.push(i as u32);
-        } else {
-            other_syms.push(i as u32);
-        }
-    }
-
-    // IDA sorts: STT_FUNC SHN_UNDEF first (by dynsym index), then all others (by dynsym index).
-    // Both groups are already in ascending dynsym index order from the loop above.
-    let ordered: Vec<u32> = func_syms.iter().chain(other_syms.iter()).copied().collect();
-
-    if ordered.is_empty() {
-        return HashMap::new();
-    }
-
-    // Build dynsym_index → extern_va assignment.
-    let sym_to_extern: HashMap<u32, u64> = ordered
-        .iter()
-        .enumerate()
-        .map(|(i, &sym_idx)| (sym_idx, extern_base + i as u64 * 8))
-        .collect();
-
-    // Relocation types that carry a GOT slot for an imported symbol.
-    // x86-64: R_X86_64_GLOB_DAT (6), R_X86_64_JUMP_SLOT (7)
-    // AArch64: R_AARCH64_GLOB_DAT (1025), R_AARCH64_JUMP_SLOT (1026)
+/// These are the GOT entries that the dynamic linker fills with import
+/// addresses.  Used by the x86-64 scanner to distinguish actual GOT-indirect
+/// calls (`CALL [RIP+got_slot]`) from other RIP-relative indirect calls.
+fn build_elf_got_slots(elf: &goblin::elf::Elf, pie_base: u64) -> HashSet<Va> {
     const R_X86_64_GLOB_DAT: u32 = 6;
     const R_X86_64_JUMP_SLOT: u32 = 7;
     const R_AARCH64_GLOB_DAT: u32 = 1025;
@@ -771,20 +687,12 @@ fn build_elf_got_map(elf: &goblin::elf::Elf, pie_base: u64) -> HashMap<Va, Va> {
         )
     };
 
-    // For each GLOB_DAT/JUMP_SLOT reloc referencing an SHN_UNDEF symbol,
-    // map got_slot_va → extern_va.
     elf.dynrelas
         .iter()
         .chain(elf.dynrels.iter())
         .chain(elf.pltrelocs.iter())
-        .filter_map(|rel| {
-            if !is_got_reloc(rel.r_type) || rel.r_sym == 0 {
-                return None;
-            }
-            let extern_va = sym_to_extern.get(&(rel.r_sym as u32))?;
-            let got_va = Va(rel.r_offset + pie_base);
-            Some((got_va, Va(*extern_va)))
-        })
+        .filter(|rel| is_got_reloc(rel.r_type) && rel.r_sym != 0)
+        .map(|rel| Va(rel.r_offset + pie_base))
         .collect()
 }
 
@@ -887,7 +795,7 @@ fn parse_macho(
         entry_points,
         symbols,
         pie_base: 0,
-        got_map: HashMap::new(),
+        got_slots: HashSet::new(),
     })
 }
 
@@ -1019,7 +927,7 @@ fn parse_pe(
         entry_points,
         symbols,
         pie_base: 0,
-        got_map: HashMap::new(),
+        got_slots: HashSet::new(),
     })
 }
 
