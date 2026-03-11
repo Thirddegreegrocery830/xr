@@ -27,6 +27,53 @@ const ADRP_WINDOW: usize = 8;
 /// Maximum entries in a recovered jump table.
 const MAX_JUMP_TABLE_ENTRIES: usize = 8192;
 
+/// Maximum left-shift applied to table entry offsets.
+///
+/// The ADD before BR uses LSL/UXTB/SXTH with a shift amount.  In practice
+/// this is 0 (direct byte offset) or 2 (instruction-aligned); values above 4
+/// are implausible for jump tables and likely indicate a misidentified pattern.
+const MAX_JUMP_TABLE_SHIFT: u32 = 4;
+
+// ── Register newtype ─────────────────────────────────────────────────────────
+
+/// An ARM64 general-purpose register index in 0..=30 (X0–X30).
+///
+/// Register 31 encodes either SP or ZR depending on context; we never track
+/// it, so the constructor rejects it.  Using `Reg` instead of bare `usize`
+/// eliminates every scattered `if rd < 31` guard — the check is done once at
+/// construction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Reg(u8);
+
+impl Reg {
+    /// Try to convert a raw 5-bit field (0–31) into a trackable register.
+    /// Returns `None` for register 31 (SP/ZR).
+    #[inline]
+    fn new(raw: u8) -> Option<Self> {
+        if raw < 31 { Some(Self(raw)) } else { None }
+    }
+
+    /// Construct from an `Arm64Insn`'s Rd field.
+    #[inline]
+    fn from_rd(insn: Arm64Insn) -> Option<Self> {
+        Self::new(insn.rd())
+    }
+
+    /// Construct from an `Arm64Insn`'s Rn field.
+    #[inline]
+    fn from_rn(insn: Arm64Insn) -> Option<Self> {
+        Self::new(insn.rn())
+    }
+
+    /// Index into a 32-element register array.
+    #[inline]
+    fn idx(self) -> usize {
+        self.0 as usize
+    }
+}
+
+// ── Per-register scan state ──────────────────────────────────────────────────
+
 /// How this register value was resolved — determines what xref kinds it can
 /// produce downstream.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,6 +104,67 @@ struct AdrpRegState {
     source: RegSource,
 }
 
+/// Exclusive upper bound extracted from `CMP Wn, #imm` (= SUBS WZR, Wn, #imm).
+///
+/// Stored as `imm + 1` so the value directly represents the number of valid
+/// table indices `0..bound`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CmpBound(u32);
+
+impl CmpBound {
+    /// Number of table entries this bound allows (clamped to a global max).
+    fn table_limit(self) -> usize {
+        (self.0 as usize).min(MAX_JUMP_TABLE_ENTRIES)
+    }
+}
+
+/// Bundles the two per-register state arrays that `scan_adrp` maintains.
+///
+/// All accesses go through [`Reg`], so the `< 31` bound is enforced once at
+/// construction rather than at every use site.
+struct ScanState {
+    adrp: [Option<AdrpRegState>; 32],
+    cmp:  [Option<CmpBound>; 32],
+}
+
+impl ScanState {
+    fn new() -> Self {
+        Self {
+            adrp: [None; 32],
+            cmp:  [None; 32],
+        }
+    }
+
+    #[inline]
+    fn get_adrp(&self, r: Reg) -> Option<AdrpRegState> {
+        self.adrp[r.idx()]
+    }
+    #[inline]
+    fn set_adrp(&mut self, r: Reg, st: AdrpRegState) {
+        self.adrp[r.idx()] = Some(st);
+        self.cmp[r.idx()] = None;
+    }
+    #[inline]
+    fn clear(&mut self, r: Reg) {
+        self.adrp[r.idx()] = None;
+        self.cmp[r.idx()] = None;
+    }
+    #[inline]
+    fn clear_adrp(&mut self, r: Reg) {
+        self.adrp[r.idx()] = None;
+    }
+    #[inline]
+    fn set_cmp(&mut self, r: Reg, bound: CmpBound) {
+        self.cmp[r.idx()] = Some(bound);
+    }
+    #[inline]
+    fn get_cmp(&self, r: Reg) -> Option<CmpBound> {
+        self.cmp[r.idx()]
+    }
+}
+
+// ── Depth-1 scan ─────────────────────────────────────────────────────────────
+
 /// Depth 1: linear scan, immediate targets only.
 /// No register tracking. Fast, no false positives on immediate targets.
 pub(crate) fn scan_linear(
@@ -65,11 +173,11 @@ pub(crate) fn scan_linear(
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
-    let base = region.base_va.raw();
+    let base = region.base_va;
 
     // ARM64: all instructions are exactly 4 bytes, 4-byte aligned.
     // If base_va is not 4-byte aligned something is wrong with the loader.
-    if !base.is_multiple_of(4) {
+    if !base.raw().is_multiple_of(4) {
         return xrefs;
     }
 
@@ -88,6 +196,8 @@ pub(crate) fn scan_linear(
     xrefs
 }
 
+// ── Depth-2 scan ─────────────────────────────────────────────────────────────
+
 /// Depth 2: ADRP pairing + all depth-1 refs.
 /// Returns combined set — superset of depth 1.
 pub(crate) fn scan_adrp(
@@ -97,18 +207,14 @@ pub(crate) fn scan_adrp(
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
-    let base = region.base_va.raw();
+    let base = region.base_va;
 
-    if !base.is_multiple_of(4) {
+    if !base.raw().is_multiple_of(4) {
         return xrefs;
     }
 
     let n = data.len() / 4;
-
-    let mut adrp_state: [Option<AdrpRegState>; 32] = [None; 32];
-    // CMP bound per register: when we see `CMP wN, #imm` (followed by B.HI),
-    // record cmp_bound[N] = imm+1 (exclusive upper bound for switch index).
-    let mut cmp_bound: [Option<u32>; 32] = [None; 32];
+    let mut state = ScanState::new();
 
     for i in 0..n {
         let offset = i * 4;
@@ -120,22 +226,23 @@ pub(crate) fn scan_adrp(
         // Fast-path: most instructions are not in the tracked set (BL/B/ADRP/ADD/LDR/STR/…).
         // For those we only need to invalidate their destination register — skip full decode.
         if !Arm64Insn::is_tracked(word) {
-            let rd = (word & 0x1F) as usize;
-            if rd < 31 {
-                adrp_state[rd] = None;
-                cmp_bound[rd] = None;
+            let raw_rd = (word & 0x1F) as u8;
+            if let Some(rd) = Reg::new(raw_rd) {
+                state.clear(rd);
             }
             // CMP Wn, #imm (= SUBS WZR, Wn, #imm): 0111_0001_00xx_xxxx_xxxx_xxnn_nnn1_1111
             // CMP Xn, #imm (= SUBS XZR, Xn, #imm): 1111_0001_00xx_xxxx_xxxx_xxnn_nnn1_1111
-            // Both have Rd=11111 (XZR/WZR), so rd==31 and we skip the invalidation above.
-            // We detect CMP via: bits[30:24]=1110001 or 1110001, bit[31]=size, Rd=11111.
-            if rd == 31 && word & 0x7F80_0000 == 0x7100_0000 {
-                let rn = ((word >> 5) & 0x1F) as usize;
+            // Both have Rd=11111 (XZR/WZR), so raw_rd==31 and we skip the invalidation above.
+            // Mask 0x7F80_0000 covers bits[30:23]; match 0x7100_0000 requires
+            // op=1(SUB), S=1, shift=00 — accepts both sf=0 (W) and sf=1 (X).
+            if raw_rd == 31 && word & 0x7F80_0000 == 0x7100_0000 {
+                let rn_raw = ((word >> 5) & 0x1F) as u8;
                 let imm12 = (word >> 10) & 0xFFF;
                 let shift = (word >> 22) & 1;
-                if shift == 0 && rn < 31 {
-                    // cmp_bound = imm + 1 (exclusive upper bound for table size)
-                    cmp_bound[rn] = Some(imm12 + 1);
+                if let Some(rn) = Reg::new(rn_raw) {
+                    if shift == 0 {
+                        state.set_cmp(rn, CmpBound(imm12 + 1));
+                    }
                 }
             }
             continue;
@@ -151,16 +258,14 @@ pub(crate) fn scan_adrp(
         // Second: ADRP tracking
         match insn {
             Arm64Insn::Adrp(_) => {
-                let rd = insn.rd() as usize;
-                if rd < 31 {
-                    let page = insn.adrp_page(va);
-                    adrp_state[rd] = Some(AdrpRegState {
+                if let Some(rd) = Reg::from_rd(insn) {
+                    let page = insn.adrp_page(va.raw());
+                    state.set_adrp(rd, AdrpRegState {
                         insn_index: i,
-                        origin_va: Va::new(va),
+                        origin_va: va,
                         value: Va::new(page),
                         source: RegSource::Direct,
                     });
-                    cmp_bound[rd] = None;
                 }
             }
 
@@ -169,26 +274,24 @@ pub(crate) fn scan_adrp(
                 // No data_ptr is emitted (analysis: 3949 FPs, 0 TPs vs IDA).
                 // We DO track the value in state so downstream stores/loads via
                 // this register can be resolved (e.g. STLXR [x19] where ADR set x19).
-                let rd = insn.rd() as usize;
-                if rd < 31 {
-                    let target = insn.adr_target(va);
-                    adrp_state[rd] = Some(AdrpRegState {
+                if let Some(rd) = Reg::from_rd(insn) {
+                    let target = insn.adr_target(va.raw());
+                    state.set_adrp(rd, AdrpRegState {
                         insn_index: i,
-                        origin_va: Va::new(va),
+                        origin_va: va,
                         value: Va::new(target),
                         source: RegSource::Direct,
                     });
-                    cmp_bound[rd] = None;
                 }
             }
 
             Arm64Insn::AddImm(_) => {
                 // ADD Xd, Xn, #imm  — completes ADRP+ADD pairs.
                 // Emits data_ptr at ADRP VA only (not ADD VA — ~6981 FPs vs ~454 TPs).
-                let rd = insn.rd() as usize;
-                let rn = insn.rn() as usize;
-                if rn < 31 {
-                    if let Some(st) = adrp_state[rn] {
+                let rd = Reg::from_rd(insn);
+                let rn = Reg::from_rn(insn);
+                if let Some(rn) = rn {
+                    if let Some(st) = state.get_adrp(rn) {
                         if i - st.insn_index <= ADRP_WINDOW {
                             let target = st.value + insn.add_imm();
                             if idx.contains(target) {
@@ -199,17 +302,16 @@ pub(crate) fn scan_adrp(
                                     confidence: Confidence::PairResolved,
                                 });
                             }
-                            if rd < 31 {
-                                adrp_state[rd] = Some(AdrpRegState {
+                            if let Some(rd) = rd {
+                                state.set_adrp(rd, AdrpRegState {
                                     insn_index: i,
                                     origin_va: st.origin_va,
                                     value: target,
                                     source: RegSource::Direct,
                                 });
-                                cmp_bound[rd] = None;
                             }
-                            if rd != rn {
-                                adrp_state[rn] = None;
+                            if rd != Some(rn) {
+                                state.clear_adrp(rn);
                             }
                         }
                     }
@@ -221,13 +323,13 @@ pub(crate) fn scan_adrp(
                 // IMPORTANT: snapshot adrp_state[rn] BEFORE clearing adrp_state[rt],
                 // because Rt == Rn is common (e.g. `ADRP X0, page; LDR X0, [X0, #off]`).
 
-                let rt = insn.rd() as usize;
-                let rn = insn.rn() as usize;
+                let rt = Reg::from_rd(insn);
+                let rn = Reg::from_rn(insn);
                 let is_64bit = insn.ldr_str_size() == 3;
 
-                let base_state = if rn < 31 { adrp_state[rn] } else { None };
-                if rt < 31 {
-                    adrp_state[rt] = None;
+                let base_state = rn.and_then(|r| state.get_adrp(r));
+                if let Some(rt) = rt {
+                    state.clear_adrp(rt);
                 }
 
                 if let Some(st) = base_state {
@@ -245,7 +347,7 @@ pub(crate) fn scan_adrp(
                             });
                             // data_read at LDR VA
                             xrefs.push(Xref {
-                                from: Va::new(va),
+                                from: va,
                                 to: addr,
                                 kind: XrefKind::DataRead,
                                 confidence: Confidence::PairResolved,
@@ -263,15 +365,15 @@ pub(crate) fn scan_adrp(
 
                         if let Some(v) = stored_val {
                             xrefs.push(Xref {
-                                from: Va::new(va),
+                                from: va,
                                 to: Va::new(v),
                                 kind: XrefKind::DataPointer,
                                 confidence: Confidence::PairResolved,
                             });
-                            if rt < 31 {
-                                adrp_state[rt] = Some(AdrpRegState {
+                            if let Some(rt) = rt {
+                                state.set_adrp(rt, AdrpRegState {
                                     insn_index: i,
-                                    origin_va: Va::new(va),
+                                    origin_va: va,
                                     value: Va::new(v),
                                     source: RegSource::Chain,
                                 });
@@ -283,9 +385,8 @@ pub(crate) fn scan_adrp(
 
             Arm64Insn::Str(_) => {
                 // STR Xn, [Xm, #imm]  — data write via ADRP-resolved address.
-                let rn = insn.rn() as usize;
-                if rn < 31 {
-                    if let Some(st) = adrp_state[rn] {
+                if let Some(rn) = Reg::from_rn(insn) {
+                    if let Some(st) = state.get_adrp(rn) {
                         if i - st.insn_index <= ADRP_WINDOW {
                             let addr = st.value + insn.ldr_str_offset();
                             let is_writable_data = idx.flags_at(addr).is_some_and(|f| {
@@ -293,7 +394,7 @@ pub(crate) fn scan_adrp(
                             });
                             if is_writable_data {
                                 xrefs.push(Xref {
-                                    from: Va::new(va),
+                                    from: va,
                                     to: addr,
                                     kind: XrefKind::DataWrite,
                                     confidence: Confidence::PairResolved,
@@ -306,12 +407,11 @@ pub(crate) fn scan_adrp(
 
             Arm64Insn::Blr(_) => {
                 // BLR Xn — indirect call via ADRP-resolved address (non-chain only).
-                let rn = insn.rn() as usize;
-                if rn < 31 {
-                    if let Some(st) = adrp_state[rn] {
+                if let Some(rn) = Reg::from_rn(insn) {
+                    if let Some(st) = state.get_adrp(rn) {
                         if st.source == RegSource::Direct && i - st.insn_index <= ADRP_WINDOW && idx.is_exec(st.value) {
                             xrefs.push(Xref {
-                                from: Va::new(va),
+                                from: va,
                                 to: st.value,
                                 kind: XrefKind::Call,
                                 confidence: Confidence::PairResolved,
@@ -323,12 +423,11 @@ pub(crate) fn scan_adrp(
 
             Arm64Insn::Br(_) => {
                 // BR Xn — indirect jump via ADRP-resolved address (non-chain only).
-                let rn = insn.rn() as usize;
-                if rn < 31 {
-                    if let Some(st) = adrp_state[rn] {
+                if let Some(rn) = Reg::from_rn(insn) {
+                    if let Some(st) = state.get_adrp(rn) {
                         if st.source == RegSource::Direct && i - st.insn_index <= ADRP_WINDOW && idx.is_exec(st.value) {
                             xrefs.push(Xref {
-                                from: Va::new(va),
+                                from: va,
                                 to: st.value,
                                 kind: XrefKind::Jump,
                                 confidence: Confidence::PairResolved,
@@ -338,17 +437,14 @@ pub(crate) fn scan_adrp(
                 }
                 // Attempt jump table recovery by scanning backward for the
                 // ADR+LDR[BH]+ADD pattern.
-                recover_arm64_jump_table(
-                    Va::new(va),
-                    i,
+                let jt_ctx = JumpTableCtx {
                     data,
                     base,
-                    &adrp_state,
-                    &cmp_bound,
+                    state: &state,
                     data_idx,
-                    idx,
-                    &mut xrefs,
-                );
+                    seg_idx: idx,
+                };
+                recover_arm64_jump_table(va, i, &jt_ctx, &mut xrefs);
             }
 
             // Any instruction that writes to a register we're tracking
@@ -365,10 +461,8 @@ pub(crate) fn scan_adrp(
             | Arm64Insn::Tbz(_)
             | Arm64Insn::Tbnz(_)
             | Arm64Insn::Other(_) => {
-                let rd = insn.rd() as usize;
-                if rd < 31 {
-                    adrp_state[rd] = None;
-                    cmp_bound[rd] = None;
+                if let Some(rd) = Reg::from_rd(insn) {
+                    state.clear(rd);
                 }
             }
         }
@@ -378,6 +472,104 @@ pub(crate) fn scan_adrp(
 }
 
 // ── Jump table recovery ─────────────────────────────────────────────────────
+
+/// Width of each entry in a recovered jump table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JumpTableEntrySize {
+    /// LDRB — each table entry is a single unsigned byte.
+    Byte,
+    /// LDRH — each table entry is a little-endian unsigned halfword.
+    Halfword,
+}
+
+impl JumpTableEntrySize {
+    /// Size in bytes of a single table entry.
+    fn bytes(self) -> u64 {
+        match self {
+            Self::Byte => 1,
+            Self::Halfword => 2,
+        }
+    }
+}
+
+/// Information extracted from the ADD instruction that combines the loaded
+/// table offset with the ADR target base.
+#[derive(Clone, Copy)]
+struct JumpTableAddInfo {
+    /// Left-shift applied to the loaded offset (imm6 or imm3).
+    shift: u32,
+    /// Whether the offset is sign-extended before shifting.
+    ///
+    /// Determined by `option[2]` (bit 15) of an ADD (extended register):
+    /// set for SXTB/SXTH/SXTW/SXTX, clear for UXTB/UXTH/UXTW/UXTX.
+    sign_extend: bool,
+}
+
+impl JumpTableAddInfo {
+    /// Decode from the instruction word at the expected ADD position (BR − 1).
+    /// Returns `None` if the instruction is not a recognised ADD form, or if
+    /// the shift amount exceeds [`MAX_JUMP_TABLE_SHIFT`].
+    fn decode(word: u32) -> Option<Self> {
+        // ADD (shifted register): 1000_1011_xx0x_xxxx_xxxx_xxxx_xxxx_xxxx
+        // bit[21]=0 distinguishes from extended register form.
+        if word & 0xFF20_0000 == 0x8B00_0000 {
+            let shift = (word >> 10) & 0x3F;
+            return (shift <= MAX_JUMP_TABLE_SHIFT).then_some(Self {
+                shift,
+                sign_extend: false,
+            });
+        }
+        // ADD (extended register): 1000_1011_001x_xxxx_xxxx_xxxx_xxxx_xxxx
+        // bit[21]=1. option[2] (bit 15) selects signed extension
+        // (SXTB/SXTH/SXTW/SXTX) vs unsigned (UXTB/UXTH/UXTW/UXTX).
+        if word & 0xFFE0_0000 == 0x8B20_0000 {
+            let shift = (word >> 10) & 7;
+            let sign_extend = word & (1 << 15) != 0;
+            return (shift <= MAX_JUMP_TABLE_SHIFT).then_some(Self {
+                shift,
+                sign_extend,
+            });
+        }
+        // No shift, no sign-extend (e.g. plain ADD immediate — unlikely but safe).
+        Some(Self { shift: 0, sign_extend: false })
+    }
+
+    /// Read one table entry and apply sign-extension according to this info.
+    fn read_offset(self, entry_sz: JumpTableEntrySize, val_u8: Option<u8>, val_u16: Option<u16>) -> Option<i64> {
+        match (entry_sz, self.sign_extend) {
+            (JumpTableEntrySize::Byte, false) => val_u8.map(|v| v as i64),
+            (JumpTableEntrySize::Byte, true)  => val_u8.map(|v| (v as i8) as i64),
+            (JumpTableEntrySize::Halfword, false) => val_u16.map(|v| v as i64),
+            (JumpTableEntrySize::Halfword, true)  => val_u16.map(|v| (v as i16) as i64),
+        }
+    }
+}
+
+/// Results of the backward scan from a BR instruction.
+///
+/// All four fields must be present for jump table recovery to proceed.
+struct JumpTablePattern {
+    /// ADR target — the base address to which table offsets are added.
+    target_base: Va,
+    /// Start of the table data (from ADRP+ADD resolved via `adrp_state`).
+    table_base: Va,
+    /// Width of each table entry (byte or halfword).
+    entry_size: JumpTableEntrySize,
+    /// Register used as the switch index (from the LDR Rm field).
+    index_reg: Reg,
+}
+
+/// Shared immutable context passed through the jump-table recovery helpers.
+///
+/// Groups the parameters that every sub-function needs, replacing the
+/// long positional parameter lists.
+struct JumpTableCtx<'a> {
+    data: &'a [u8],
+    base: Va,
+    state: &'a ScanState,
+    data_idx: &'a SegmentDataIndex<'a>,
+    seg_idx: &'a SegmentIndex,
+}
 
 /// Attempt to recover an ARM64 switch-table at a `BR Xn` instruction.
 ///
@@ -398,155 +590,58 @@ pub(crate) fn scan_adrp(
 /// instruction (LDRB/LDRH with a register index into a known table address),
 /// and the CMP bound.  Table entries are unsigned byte or halfword offsets
 /// (sometimes sign-extended in the ADD) that are added to the ADR target.
-#[allow(clippy::too_many_arguments)]
 fn recover_arm64_jump_table(
     br_va: Va,
     br_index: usize,
-    data: &[u8],
-    base: u64,
-    adrp_state: &[Option<AdrpRegState>; 32],
-    cmp_bound: &[Option<u32>; 32],
-    data_idx: &SegmentDataIndex,
-    seg_idx: &SegmentIndex,
+    ctx: &JumpTableCtx,
     xrefs: &mut Vec<Xref>,
 ) {
-    // Scan up to 8 instructions before the BR looking for the pattern.
-    let lookback = br_index.min(8);
-
-    // We need three things:
-    //   1. ADR Xbase, label      → target_base
-    //   2. LDRB/LDRH Woff, [Xtbl, wIdx, ...]  → table_base (from adrp_state[Xtbl]),
-    //      entry_size (1 or 2), index_reg
-    //   3. CMP wIdx, #bound      → max_entries from cmp_bound[index_reg]
-    //
-    // The ADD between the load and BR is implicit — we don't need to verify it
-    // because we derive target_base from the ADR.
-
-    let mut target_base: Option<u64> = None;
-    let mut table_base: Option<Va> = None;
-    let mut entry_size: u32 = 0; // 1 = byte, 2 = halfword
-    let mut index_reg: usize = 32; // invalid sentinel
-
-    for back in 1..=lookback {
-        let j = br_index - back;
-        let offset = j * 4;
-        if offset + 4 > data.len() {
-            break;
-        }
-        let w = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-        let insn_va = base + offset as u64;
-
-        // ADR Xd, label
-        if (w & 0x9F00_0000) == 0x1000_0000 {
-            let rd = (w & 0x1F) as usize;
-            let immlo = (w >> 29) & 3;
-            let immhi = (w >> 5) & 0x7_FFFF;
-            let mut imm = ((immhi << 2) | immlo) as i64;
-            if imm & (1 << 20) != 0 {
-                imm -= 1 << 21;
-            }
-            let adr_target = (insn_va as i64 + imm) as u64;
-            // Only accept if this feeds the BR target register chain.
-            // We don't strictly verify register assignment — just record
-            // the ADR value closest to the BR.
-            if target_base.is_none() {
-                target_base = Some(adr_target);
-                // If ADR Rd == load Rd (register reuse), invalidate table_base
-                // match since this ADR sets the base, not the table.
-                let _ = rd; // rd is consumed by ADD chain
-            }
-        }
-
-        // LDRB (register): 0011_1000_011m_mmmm_xxxx_xxnn_nnnt_tttt
-        if (w & 0xFFE0_0C00) == 0x3860_0800 {
-            let rn = ((w >> 5) & 0x1F) as usize;
-            let rm = ((w >> 16) & 0x1F) as usize;
-            if rn < 31 {
-                if let Some(st) = adrp_state[rn] {
-                    table_base = Some(st.value);
-                    entry_size = 1;
-                    index_reg = rm;
-                }
-            }
-        }
-
-        // LDRH (register): 0111_1000_011m_mmmm_xxxx_xxnn_nnnt_tttt
-        if (w & 0xFFE0_0C00) == 0x7860_0800 {
-            let rn = ((w >> 5) & 0x1F) as usize;
-            let rm = ((w >> 16) & 0x1F) as usize;
-            if rn < 31 {
-                if let Some(st) = adrp_state[rn] {
-                    table_base = Some(st.value);
-                    entry_size = 2;
-                    index_reg = rm;
-                }
-            }
-        }
-    }
-
-    // Need all three pieces.
-    let Some(tbase) = target_base else { return };
-    let Some(tbl) = table_base else { return };
-    if entry_size == 0 || index_reg >= 32 {
-        return;
-    }
-
-    // Table size from CMP bound.  Without CMP bound, skip to avoid FP explosion.
-    let Some(bound) = cmp_bound.get(index_reg).copied().flatten() else {
+    let Some(pattern) = scan_backward_for_pattern(br_index, ctx) else {
         return;
     };
-    let limit = (bound as usize).min(MAX_JUMP_TABLE_ENTRIES);
 
-    // Determine the shift applied to the loaded offset.  The ADD before BR
-    // almost always uses `LSL #2` (shift=0, imm6=2) or an extended-register
-    // form with `imm3=2` (e.g. SXTH #2, UXTB #2).  Both mean multiply by 4.
-    // We extract this from the ADD instruction word at BR-1.
-    let n_insns = data.len() / 4;
-    let add_shift = {
-        let add_idx = br_index.wrapping_sub(1);
-        if add_idx < n_insns {
-            let add_off = add_idx * 4;
-            let aw = u32::from_le_bytes(data[add_off..add_off + 4].try_into().unwrap());
-            // ADD (shifted register): 1000_1011_xx0x_xxxx_xxxx_xxxx_xxxx_xxxx
-            if aw & 0xFF20_0000 == 0x8B00_0000 {
-                (aw >> 10) & 0x3F // imm6 = shift amount
-            }
-            // ADD (extended register): 1000_1011_001x_xxxx_xxxx_xxxx_xxxx_xxxx
-            else if aw & 0xFFE0_0000 == 0x8B20_0000 {
-                (aw >> 10) & 7 // imm3 = shift amount
-            } else {
-                0
-            }
-        } else {
-            0
-        }
+    // Table size from CMP bound.  Without a bound we bail to avoid FP explosion.
+    let Some(bound) = ctx.state.get_cmp(pattern.index_reg) else {
+        return;
     };
+    let limit = bound.table_limit();
+
+    // Extract shift / sign-extension from the ADD at BR-1.
+    let n_insns = ctx.data.len() / 4;
+    let add_info = (|| {
+        let add_idx = br_index.checked_sub(1)?;
+        if add_idx >= n_insns { return None; }
+        let add_off = add_idx * 4;
+        let aw = u32::from_le_bytes(
+            ctx.data[add_off..add_off + 4]
+                .try_into()
+                .expect("guarded by add_idx < n_insns"),
+        );
+        JumpTableAddInfo::decode(aw)
+    })()
+    .unwrap_or(JumpTableAddInfo { shift: 0, sign_extend: false });
+
+    // Reject implausible shifts — real tables use 0 or 2.
+    if add_info.shift > MAX_JUMP_TABLE_SHIFT {
+        return;
+    }
 
     for k in 0..limit {
-        let slot_va = tbl + (k as u64) * (entry_size as u64);
-        let offset_val: i64 = match entry_size {
-            1 => {
-                let Some(val) = data_idx.read_u8_at(slot_va) else {
-                    break;
-                };
-                val as i64 // unsigned byte offset
-            }
-            2 => {
-                let Some(val) = data_idx.read_u16_at(slot_va) else {
-                    break;
-                };
-                // Sign-extend if the ADD uses SXTH (option=5),
-                // otherwise unsigned.  For simplicity, treat as signed
-                // i16 → i64 (SXTH is the common case for halfword tables,
-                // and unsigned values < 0x8000 are unaffected).
-                (val as i16) as i64
-            }
-            _ => break,
-        };
+        let slot_va = pattern.table_base + (k as u64) * pattern.entry_size.bytes();
 
-        let shifted = offset_val << add_shift;
-        let target = Va::new((tbase as i64 + shifted) as u64);
-        if !seg_idx.is_exec(target) {
+        let offset_val = match pattern.entry_size {
+            JumpTableEntrySize::Byte => {
+                add_info.read_offset(pattern.entry_size, ctx.data_idx.read_u8_at(slot_va), None)
+            }
+            JumpTableEntrySize::Halfword => {
+                add_info.read_offset(pattern.entry_size, None, ctx.data_idx.read_u16_at(slot_va))
+            }
+        };
+        let Some(offset_val) = offset_val else { break };
+
+        let shifted = offset_val << add_info.shift;
+        let target = Va::new((pattern.target_base.raw() as i64).wrapping_add(shifted) as u64);
+        if !ctx.seg_idx.is_exec(target) {
             break;
         }
         xrefs.push(Xref {
@@ -558,20 +653,98 @@ fn recover_arm64_jump_table(
     }
 }
 
+/// Scan up to 8 instructions before `br_index` looking for the ADR + LDRB/LDRH
+/// pattern that forms a jump table.
+fn scan_backward_for_pattern(
+    br_index: usize,
+    ctx: &JumpTableCtx,
+) -> Option<JumpTablePattern> {
+    let lookback = br_index.min(8);
+
+    let mut target_base: Option<Va> = None;
+    let mut table_base: Option<Va> = None;
+    let mut entry_size: Option<JumpTableEntrySize> = None;
+    let mut index_reg: Option<Reg> = None;
+
+    for back in 1..=lookback {
+        let j = br_index - back;
+        let offset = j * 4;
+        if offset + 4 > ctx.data.len() {
+            break;
+        }
+        let w = u32::from_le_bytes(
+            ctx.data[offset..offset + 4]
+                .try_into()
+                .expect("guarded by offset + 4 <= data.len()"),
+        );
+        let insn_va = ctx.base + offset as u64;
+
+        // ADR Xd, label
+        if (w & 0x9F00_0000) == 0x1000_0000 {
+            let immlo = (w >> 29) & 3;
+            let immhi = (w >> 5) & 0x7_FFFF;
+            let mut imm = ((immhi << 2) | immlo) as i64;
+            if imm & (1 << 20) != 0 {
+                imm -= 1 << 21;
+            }
+            let adr_target = (insn_va.raw() as i64 + imm) as u64;
+            // Accept the first (closest to BR) ADR as target_base.
+            // TODO: verify that ADR Rd feeds the BR target register chain
+            // to reduce false positives from unrelated ADR instructions.
+            if target_base.is_none() {
+                target_base = Some(Va::new(adr_target));
+            }
+        }
+
+        // LDRB (register): 0011_1000_011m_mmmm_xxxx_xxnn_nnnt_tttt
+        if (w & 0xFFE0_0C00) == 0x3860_0800 {
+            let rn = Reg::new(((w >> 5) & 0x1F) as u8);
+            let rm = Reg::new(((w >> 16) & 0x1F) as u8);
+            if let (Some(rn), Some(rm)) = (rn, rm) {
+                if let Some(st) = ctx.state.get_adrp(rn) {
+                    table_base = Some(st.value);
+                    entry_size = Some(JumpTableEntrySize::Byte);
+                    index_reg = Some(rm);
+                }
+            }
+        }
+
+        // LDRH (register): 0111_1000_011m_mmmm_xxxx_xxnn_nnnt_tttt
+        if (w & 0xFFE0_0C00) == 0x7860_0800 {
+            let rn = Reg::new(((w >> 5) & 0x1F) as u8);
+            let rm = Reg::new(((w >> 16) & 0x1F) as u8);
+            if let (Some(rn), Some(rm)) = (rn, rm) {
+                if let Some(st) = ctx.state.get_adrp(rn) {
+                    table_base = Some(st.value);
+                    entry_size = Some(JumpTableEntrySize::Halfword);
+                    index_reg = Some(rm);
+                }
+            }
+        }
+    }
+
+    Some(JumpTablePattern {
+        target_base: target_base?,
+        table_base: table_base?,
+        entry_size: entry_size?,
+        index_reg: index_reg?,
+    })
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Extract an immediate xref from instructions with direct targets.
 #[inline(always)]
-fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> {
+fn immediate_xref(insn: Arm64Insn, va: Va, idx: &SegmentIndex) -> Option<Xref> {
     match insn {
         Arm64Insn::Bl(_) => {
-            let target = insn.imm26_target(va);
+            let target = Va::new(insn.imm26_target(va.raw()));
             // IDA records calls only to executable addresses. Suppress BL to non-exec
             // (e.g. BL to .rodata in dead code regions — IDA never records these).
-            if idx.contains(Va::new(target)) && idx.is_exec(Va::new(target)) {
+            if idx.contains(target) && idx.is_exec(target) {
                 Some(Xref {
-                    from: Va::new(va),
-                    to: Va::new(target),
+                    from: va,
+                    to: target,
                     kind: XrefKind::Call,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -580,11 +753,11 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
             }
         }
         Arm64Insn::B(_) => {
-            let target = insn.imm26_target(va);
-            if idx.contains(Va::new(target)) {
+            let target = Va::new(insn.imm26_target(va.raw()));
+            if idx.contains(target) {
                 Some(Xref {
-                    from: Va::new(va),
-                    to: Va::new(target),
+                    from: va,
+                    to: target,
                     kind: XrefKind::Jump,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -593,11 +766,11 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
             }
         }
         Arm64Insn::BCond(_) => {
-            let target = insn.imm19_target(va);
-            if idx.contains(Va::new(target)) {
+            let target = Va::new(insn.imm19_target(va.raw()));
+            if idx.contains(target) {
                 Some(Xref {
-                    from: Va::new(va),
-                    to: Va::new(target),
+                    from: va,
+                    to: target,
                     kind: XrefKind::CondJump,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -607,11 +780,11 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
         }
         Arm64Insn::Cbz(_) | Arm64Insn::Cbnz(_) => {
             // CBZ/CBNZ Xn, #label — label is second operand
-            let target = insn.cbz_target(va);
-            if idx.contains(Va::new(target)) {
+            let target = Va::new(insn.cbz_target(va.raw()));
+            if idx.contains(target) {
                 Some(Xref {
-                    from: Va::new(va),
-                    to: Va::new(target),
+                    from: va,
+                    to: target,
                     kind: XrefKind::CondJump,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -621,11 +794,11 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
         }
         Arm64Insn::Tbz(_) | Arm64Insn::Tbnz(_) => {
             // TBZ/TBNZ Xn, #bit, #label — label is third operand
-            let target = insn.imm14_target(va);
-            if idx.contains(Va::new(target)) {
+            let target = Va::new(insn.imm14_target(va.raw()));
+            if idx.contains(target) {
                 Some(Xref {
-                    from: Va::new(va),
-                    to: Va::new(target),
+                    from: va,
+                    to: target,
                     kind: XrefKind::CondJump,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -636,11 +809,11 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
         Arm64Insn::LdrLiteral(_) => {
             // LDR Xt/Wt, label — PC-relative literal load.
             // IDA records data_read at this VA to the literal pool address.
-            let target = insn.ldr_literal_target(va);
-            if idx.contains(Va::new(target)) {
+            let target = Va::new(insn.ldr_literal_target(va.raw()));
+            if idx.contains(target) {
                 Some(Xref {
-                    from: Va::new(va),
-                    to: Va::new(target),
+                    from: va,
+                    to: target,
                     kind: XrefKind::DataRead,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -682,6 +855,20 @@ mod tests {
             byte_scannable: true,
             mode: DecodeMode::Default,
             name: "test".to_string(),
+        }
+    }
+
+    /// Build a non-executable data segment at `base_va`.
+    fn fake_data_seg(base_va: u64, data: &'static [u8]) -> Segment {
+        Segment {
+            va: Va::new(base_va),
+            data,
+            executable: false,
+            readable: true,
+            writable: false,
+            byte_scannable: false,
+            mode: DecodeMode::Default,
+            name: "rodata".to_string(),
         }
     }
 
@@ -850,6 +1037,108 @@ mod tests {
         assert!(
             xrefs.is_empty(),
             "xref to unmapped target should be suppressed"
+        );
+    }
+
+    // ── Jump table recovery ──────────────────────────────────────────────────
+
+    /// Canonical byte-entry jump table:
+    ///   CMP W2, #3 / B.HI / ADRP X1 / ADD X1,X1,#0x100 /
+    ///   ADR X3, after_br / LDRB W4,[X1,W2,UXTW] / ADD X3,X3,X4,UXTB#2 / BR X3
+    /// Table at 0x20100 with byte offsets [0, 1, 2, 3].
+    /// target_base = 0x10020 (ADR target = BR + 4), shift = 2.
+    /// Expected targets: 0x10020, 0x10024, 0x10028, 0x1002C.
+    #[test]
+    fn test_jump_table_byte_entries() {
+        #[rustfmt::skip]
+        static CODE: [u8; 48] = [
+            0x5F, 0x0C, 0x00, 0x71, // 0x10000: CMP W2, #3
+            0x08, 0x01, 0x00, 0x54, // 0x10004: B.HI +32
+            0x81, 0x00, 0x00, 0x90, // 0x10008: ADRP X1, +16 pages (→ 0x20000)
+            0x21, 0x00, 0x04, 0x91, // 0x1000C: ADD  X1, X1, #0x100
+            0x83, 0x00, 0x00, 0x10, // 0x10010: ADR  X3, +0x10 (→ 0x10020)
+            0x24, 0x48, 0x62, 0x38, // 0x10014: LDRB W4, [X1, W2, UXTW]
+            0x63, 0x08, 0x24, 0x8B, // 0x10018: ADD  X3, X3, X4, UXTB #2
+            0x60, 0x00, 0x1F, 0xD6, // 0x1001C: BR   X3
+            0x1F, 0x20, 0x03, 0xD5, // 0x10020: NOP (target 0)
+            0x1F, 0x20, 0x03, 0xD5, // 0x10024: NOP (target 1)
+            0x1F, 0x20, 0x03, 0xD5, // 0x10028: NOP (target 2)
+            0x1F, 0x20, 0x03, 0xD5, // 0x1002C: NOP (target 3)
+        ];
+        // Data segment: 4-byte table at offset 0x100.
+        static TABLE_DATA: [u8; 0x200] = {
+            let mut d = [0u8; 0x200];
+            d[0x100] = 0; // entry 0: offset = 0 → 0 << 2 = 0
+            d[0x101] = 1; // entry 1: offset = 1 → 1 << 2 = 4
+            d[0x102] = 2; // entry 2: offset = 2 → 2 << 2 = 8
+            d[0x103] = 3; // entry 3: offset = 3 → 3 << 2 = 12
+            d
+        };
+
+        let code_seg = fake_seg(0x10000, &CODE);
+        let segs = vec![fake_seg(0x10000, &CODE), fake_data_seg(0x20000, &TABLE_DATA)];
+
+        let idx = SegmentIndex::build(&segs);
+        let didx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_adrp(&region_for(&code_seg), &idx, &didx);
+
+        let jt_xrefs: Vec<&Xref> = xrefs
+            .iter()
+            .filter(|x| x.kind == XrefKind::Jump && x.from == Va::new(0x1001C))
+            .collect();
+        assert_eq!(jt_xrefs.len(), 4, "expected 4 jump table targets, got {jt_xrefs:?}");
+        let targets: Vec<Va> = jt_xrefs.iter().map(|x| x.to).collect();
+        assert!(targets.contains(&Va::new(0x10020)));
+        assert!(targets.contains(&Va::new(0x10024)));
+        assert!(targets.contains(&Va::new(0x10028)));
+        assert!(targets.contains(&Va::new(0x1002C)));
+        // All should have LocalProp confidence.
+        assert!(jt_xrefs.iter().all(|x| x.confidence == Confidence::LocalProp));
+    }
+
+    /// Jump table recovery should bail when no CMP bound is present.
+    #[test]
+    fn test_jump_table_no_cmp_bound_bails() {
+        // Same pattern as above but without the CMP instruction.
+        // Replace CMP with NOP; recovery should produce zero jump xrefs.
+        #[rustfmt::skip]
+        static CODE: [u8; 48] = [
+            0x1F, 0x20, 0x03, 0xD5, // 0x10000: NOP (was CMP)
+            0x08, 0x01, 0x00, 0x54, // 0x10004: B.HI +32
+            0x81, 0x00, 0x00, 0x90, // 0x10008: ADRP X1, +16 pages
+            0x21, 0x00, 0x04, 0x91, // 0x1000C: ADD  X1, X1, #0x100
+            0x83, 0x00, 0x00, 0x10, // 0x10010: ADR  X3, +0x10
+            0x24, 0x48, 0x62, 0x38, // 0x10014: LDRB W4, [X1, W2, UXTW]
+            0x63, 0x08, 0x24, 0x8B, // 0x10018: ADD  X3, X3, X4, UXTB #2
+            0x60, 0x00, 0x1F, 0xD6, // 0x1001C: BR   X3
+            0x1F, 0x20, 0x03, 0xD5, // 0x10020: NOP
+            0x1F, 0x20, 0x03, 0xD5, // 0x10024: NOP
+            0x1F, 0x20, 0x03, 0xD5, // 0x10028: NOP
+            0x1F, 0x20, 0x03, 0xD5, // 0x1002C: NOP
+        ];
+        static TABLE_DATA: [u8; 0x200] = {
+            let mut d = [0u8; 0x200];
+            d[0x100] = 0;
+            d[0x101] = 1;
+            d[0x102] = 2;
+            d[0x103] = 3;
+            d
+        };
+
+        let code_seg = fake_seg(0x10000, &CODE);
+        let segs = vec![fake_seg(0x10000, &CODE), fake_data_seg(0x20000, &TABLE_DATA)];
+
+        let idx = SegmentIndex::build(&segs);
+        let didx = SegmentDataIndex::build(&segs);
+        let xrefs = scan_adrp(&region_for(&code_seg), &idx, &didx);
+
+        let jt_xrefs: Vec<&Xref> = xrefs
+            .iter()
+            .filter(|x| x.kind == XrefKind::Jump && x.from == Va::new(0x1001C))
+            .collect();
+        assert!(
+            jt_xrefs.is_empty(),
+            "no jump table xrefs without CMP bound, got {jt_xrefs:?}"
         );
     }
 }
