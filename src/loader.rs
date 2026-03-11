@@ -112,6 +112,14 @@ pub struct LoadedBinary {
     /// (vs arbitrary RIP-relative indirect calls through non-GOT pointers).
     /// Populated for ELF binaries; empty for Mach-O and PE.
     pub got_slots: HashSet<Va>,
+    /// Relocation-derived pointer pairs `(from_va, to_va)`.
+    ///
+    /// Each entry represents a pointer-sized slot at `from_va` that the
+    /// relocation table says points to `to_va`.  Emitted as `DataPointer`
+    /// xrefs in the scan pass.  Populated from ELF `.rela.dyn` / `.rel.dyn`
+    /// (R_*_RELATIVE, R_*_64, R_*_ABS64) and PE base relocations + IAT.
+    /// Empty for formats without relocation tables.
+    pub reloc_pointers: Vec<(Va, Va)>,
     /// The underlying mmap — kept alive here.
     _mmap: Mmap,
     /// Zero-filled BSS buffers allocated by the loader.
@@ -160,6 +168,7 @@ impl LoadedBinary {
                 symbols: p.symbols,
                 pie_base: p.pie_base,
                 got_slots: p.got_slots,
+                reloc_pointers: p.reloc_pointers,
                 _mmap: mmap,
                 _bss_bufs: vec![],
                 _dyld_ctx: Some(Box::new(result.dyld_ctx)),
@@ -182,6 +191,7 @@ impl LoadedBinary {
             symbols: p.symbols,
             pie_base: p.pie_base,
             got_slots: p.got_slots,
+            reloc_pointers: p.reloc_pointers,
             _mmap: mmap,
             _bss_bufs: bss_bufs,
             _dyld_ctx: None,
@@ -203,6 +213,7 @@ impl LoadedBinary {
             symbols: vec![],
             pie_base: 0,
             got_slots: HashSet::new(),
+            reloc_pointers: Vec::new(),
             _mmap: mmap,
             _bss_bufs: vec![],
             _dyld_ctx: None,
@@ -263,6 +274,8 @@ struct ParseResult {
     pie_base: u64,
     /// GOT slot VAs from GLOB_DAT / JUMP_SLOT relocs. Empty for non-ELF.
     got_slots: HashSet<Va>,
+    /// Relocation-derived pointer pairs `(from_va, to_va)`.
+    reloc_pointers: Vec<(Va, Va)>,
 }
 
 /// Allocate a zero-filled buffer of `size` bytes, store it in `bufs` for
@@ -312,6 +325,7 @@ fn parse_binary(
                 symbols: vec![],
                 pie_base: 0,
                 got_slots: HashSet::new(),
+                reloc_pointers: Vec::new(),
             })
         }
         _ => Err(anyhow!("unsupported binary format")),
@@ -395,6 +409,7 @@ fn parse_dyld_cache(path: &Path) -> Result<DyldParseResult> {
             symbols: vec![],
             pie_base: 0,
             got_slots: HashSet::new(),
+            reloc_pointers: Vec::new(),
         },
         dyld_ctx: ctx,
     })
@@ -665,8 +680,9 @@ fn parse_elf(
     //   extern_va[i] = extern_base + i * 8
     //   Map: got_slot_va = r_offset+pie_base → extern_va for each GLOB_DAT/JUMP_SLOT reloc
     let got_slots = build_elf_got_slots(elf, pie_base);
+    let reloc_pointers = build_elf_reloc_pointers(elf, pie_base, &segments);
 
-    Ok(ParseResult { arch, segments, entry_points, symbols, pie_base, got_slots })
+    Ok(ParseResult { arch, segments, entry_points, symbols, pie_base, got_slots, reloc_pointers })
 }
 
 /// Collect the set of GOT slot VAs from GLOB_DAT / JUMP_SLOT relocations.
@@ -694,6 +710,74 @@ fn build_elf_got_slots(elf: &goblin::elf::Elf, pie_base: u64) -> HashSet<Va> {
         .filter(|rel| is_got_reloc(rel.r_type) && rel.r_sym != 0)
         .map(|rel| Va(rel.r_offset + pie_base))
         .collect()
+}
+
+/// Extract relocation-derived pointer pairs `(from_va, to_va)` from ELF
+/// relocation tables (`.rela.dyn` / `.rel.dyn`).
+///
+/// Handles:
+/// - `R_*_RELATIVE` (no symbol): `from = r_offset + pie_base`, `target = r_addend + pie_base`
+/// - `R_*_64` / `R_*_ABS64` (with defined symbol): `from = r_offset + pie_base`,
+///   `target = sym.st_value + pie_base + r_addend`
+///
+/// Only emits pairs where `target` falls within a mapped segment (filters out
+/// references to external/undefined symbols).
+fn build_elf_reloc_pointers(
+    elf: &goblin::elf::Elf,
+    pie_base: u64,
+    segments: &[Segment],
+) -> Vec<(Va, Va)> {
+    use goblin::elf::section_header::SHN_UNDEF;
+
+    // Relocation types that encode a full pointer value.
+    const R_X86_64_RELATIVE: u32 = 8;
+    const R_X86_64_64: u32 = 1;
+    const R_AARCH64_RELATIVE: u32 = 1027;
+    const R_AARCH64_ABS64: u32 = 257;
+
+    // Quick segment membership check: build sorted (start, end) intervals.
+    let seg_ranges: Vec<(u64, u64)> = segments
+        .iter()
+        .map(|s| (s.va.raw(), s.va.raw() + s.data.len() as u64))
+        .collect();
+    let in_segment = |va: u64| -> bool {
+        seg_ranges
+            .iter()
+            .any(|&(start, end)| va >= start && va < end)
+    };
+
+    let mut result = Vec::new();
+
+    for rel in elf.dynrelas.iter().chain(elf.dynrels.iter()) {
+        let from = rel.r_offset + pie_base;
+        let r_type = rel.r_type;
+
+        if r_type == R_X86_64_RELATIVE || r_type == R_AARCH64_RELATIVE {
+            // RELATIVE: target = pie_base + addend (no symbol lookup).
+            let target = (rel.r_addend.unwrap_or(0) as u64).wrapping_add(pie_base);
+            if in_segment(target) {
+                result.push((Va(from), Va(target)));
+            }
+        } else if r_type == R_X86_64_64 || r_type == R_AARCH64_ABS64 {
+            // ABS64: target = sym.st_value + pie_base + addend (defined symbols only).
+            if rel.r_sym != 0 {
+                let sym = &elf.dynsyms.get(rel.r_sym).or_else(|| elf.syms.get(rel.r_sym));
+                if let Some(sym) = sym {
+                    if sym.st_shndx != SHN_UNDEF as usize && sym.st_value != 0 {
+                        let target = sym
+                            .st_value
+                            .wrapping_add(pie_base)
+                            .wrapping_add(rel.r_addend.unwrap_or(0) as u64);
+                        if in_segment(target) {
+                            result.push((Va(from), Va(target)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
 fn parse_macho(
@@ -796,6 +880,7 @@ fn parse_macho(
         symbols,
         pie_base: 0,
         got_slots: HashSet::new(),
+        reloc_pointers: Vec::new(),
     })
 }
 
@@ -921,6 +1006,8 @@ fn parse_pe(
         }
     }
 
+    let reloc_pointers = build_pe_reloc_pointers(bytes, pe, image_base, &segments);
+
     Ok(ParseResult {
         arch,
         segments,
@@ -928,7 +1015,124 @@ fn parse_pe(
         symbols,
         pie_base: 0,
         got_slots: HashSet::new(),
+        reloc_pointers,
     })
+}
+
+/// Extract relocation-derived pointer pairs from PE base relocation table.
+///
+/// PE `.reloc` contains base relocation blocks. Each `IMAGE_REL_BASED_DIR64`
+/// entry (type 10) identifies a 64-bit pointer slot. We read the pointer value
+/// from the file and emit `(slot_va, pointer_value)` when the pointer falls
+/// within a mapped segment.
+fn build_pe_reloc_pointers(
+    bytes: &[u8],
+    pe: &goblin::pe::PE,
+    image_base: u64,
+    segments: &[Segment],
+) -> Vec<(Va, Va)> {
+    // Quick segment membership check.
+    let seg_ranges: Vec<(u64, u64)> = segments
+        .iter()
+        .map(|s| (s.va.raw(), s.va.raw() + s.data.len() as u64))
+        .collect();
+    let in_segment = |va: u64| -> bool {
+        seg_ranges
+            .iter()
+            .any(|&(start, end)| va >= start && va < end)
+    };
+
+    // Helper: read a 64-bit pointer from the file at a given RVA.
+    let read_ptr_at_rva = |rva: u32| -> Option<u64> {
+        for section in &pe.sections {
+            let sec_rva = section.virtual_address;
+            let sec_vsize = section.virtual_size;
+            let sec_raw_offset = section.pointer_to_raw_data as usize;
+            let sec_raw_size = section.size_of_raw_data as usize;
+            if rva >= sec_rva && rva < sec_rva + sec_vsize {
+                let offset_in_sec = (rva - sec_rva) as usize;
+                if offset_in_sec + 8 > sec_raw_size {
+                    return None;
+                }
+                let file_off = sec_raw_offset + offset_in_sec;
+                if file_off + 8 > bytes.len() {
+                    return None;
+                }
+                return Some(u64::from_le_bytes(
+                    bytes[file_off..file_off + 8].try_into().unwrap(),
+                ));
+            }
+        }
+        None
+    };
+
+    let mut result = Vec::new();
+
+    // Parse the base relocation table.
+    // Each block: 4-byte page RVA, 4-byte block size, then 2-byte entries.
+    // Entry: top 4 bits = type, bottom 12 bits = offset within the page.
+    // Type 10 = IMAGE_REL_BASED_DIR64 (64-bit pointer).
+    let reloc_dir = pe
+        .header
+        .optional_header
+        .and_then(|oh| {
+            let dd = oh.data_directories.get_base_relocation_table()?;
+            Some((dd.virtual_address, dd.size))
+        });
+
+    if let Some((dir_rva, dir_size)) = reloc_dir {
+        let reloc_rva = dir_rva as usize;
+        let reloc_size = dir_size as usize;
+
+        // Find the file offset for the reloc table.
+        let mut reloc_file_off = None;
+        for section in &pe.sections {
+            let sec_rva = section.virtual_address as usize;
+            let sec_vsize = section.virtual_size as usize;
+            if reloc_rva >= sec_rva && reloc_rva < sec_rva + sec_vsize {
+                let off_in_sec = reloc_rva - sec_rva;
+                reloc_file_off = Some(section.pointer_to_raw_data as usize + off_in_sec);
+                break;
+            }
+        }
+
+        if let Some(base_off) = reloc_file_off {
+            let reloc_bytes = bytes.get(base_off..base_off + reloc_size).unwrap_or(&[]);
+            let mut pos = 0usize;
+            while pos + 8 <= reloc_bytes.len() {
+                let page_rva =
+                    u32::from_le_bytes(reloc_bytes[pos..pos + 4].try_into().unwrap());
+                let block_size =
+                    u32::from_le_bytes(reloc_bytes[pos + 4..pos + 8].try_into().unwrap())
+                        as usize;
+                if block_size < 8 || pos + block_size > reloc_bytes.len() {
+                    break;
+                }
+                let mut entry_pos = pos + 8;
+                while entry_pos + 2 <= pos + block_size {
+                    let entry = u16::from_le_bytes(
+                        reloc_bytes[entry_pos..entry_pos + 2].try_into().unwrap(),
+                    );
+                    let rel_type = entry >> 12;
+                    let offset = entry & 0x0FFF;
+                    // Type 10 = IMAGE_REL_BASED_DIR64
+                    if rel_type == 10 {
+                        let slot_rva = page_rva + offset as u32;
+                        let slot_va = image_base + slot_rva as u64;
+                        if let Some(ptr_val) = read_ptr_at_rva(slot_rva) {
+                            if ptr_val != 0 && in_segment(ptr_val) {
+                                result.push((Va(slot_va), Va(ptr_val)));
+                            }
+                        }
+                    }
+                    entry_pos += 2;
+                }
+                pos += block_size;
+            }
+        }
+    }
+
+    result
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

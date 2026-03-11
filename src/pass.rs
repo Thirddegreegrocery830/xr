@@ -348,6 +348,32 @@ impl<'a> XrefPass<'a> {
 
             pool.install(|| {
                 let tx = tx.clone();
+
+                // Relocation-derived data pointers — emit as a single batch.
+                // These come from ELF .rela.dyn / .rel.dyn (R_*_RELATIVE, R_*_64)
+                // and are nearly 100% precise (reloc entries are authoritative).
+                if !self.binary.reloc_pointers.is_empty() {
+                    let batch: Vec<Xref> = self
+                        .binary
+                        .reloc_pointers
+                        .iter()
+                        .filter(|(from, to)| {
+                            (min_ref_va == Va::ZERO || *to >= min_ref_va)
+                                && from_range.is_none_or(|r| r.contains(*from))
+                                && to_range.is_none_or(|r| r.contains(*to))
+                        })
+                        .map(|&(from, to)| Xref {
+                            from,
+                            to,
+                            kind: crate::xref::XrefKind::DataPointer,
+                            confidence: Confidence::ByteScan,
+                        })
+                        .collect();
+                    if !batch.is_empty() {
+                        let _ = tx.send(batch);
+                    }
+                }
+
                 // Code shards — owned_end is the next shard's start (or seg_end).
                 // Xrefs with from >= owned_end are in the overlap lookahead and
                 // will be emitted by the next shard instead.
