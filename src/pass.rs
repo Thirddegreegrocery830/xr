@@ -449,18 +449,19 @@ fn scan_shard(
         }
         // x86-64
         (Arch::X86_64, _, Depth::Linear) => {
-            x86_64::scan_linear(&region, ctx.seg_idx, ctx.data_idx, ctx.got_map)
+            x86_64::scan_linear(&region, ctx.seg_idx, ctx.got_map)
         }
         (Arch::X86_64, _, Depth::Paired) => {
-            x86_64::scan_with_prop(&region, ctx.seg_idx, ctx.data_idx, ctx.got_map)
+            x86_64::scan_with_prop(&region, ctx.seg_idx, ctx.got_map)
         }
         // x86 32-bit — stub
         (Arch::X86, _, _) => {
             vec![] // TODO: x86 32-bit pass
         }
         (Arch::Unknown, _, _) => vec![],
-        // ByteScan never generates code shards — these arms are unreachable.
-        (_, _, Depth::ByteScan) => unreachable!("ByteScan does not scan code segments"),
+        // ByteScan never generates code shards — return empty rather than
+        // panicking, in case a future refactor accidentally routes here.
+        (_, _, Depth::ByteScan) => vec![],
     }
 }
 

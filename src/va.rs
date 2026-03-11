@@ -14,6 +14,16 @@ impl Va {
     pub fn raw(self) -> u64 {
         self.0
     }
+
+    /// Parse a virtual address from a string.
+    /// Accepts `0x`/`0X`-prefixed hexadecimal or plain decimal.
+    pub fn parse(s: &str) -> Result<Va, String> {
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16).map(Va).map_err(|e| e.to_string())
+        } else {
+            s.parse::<u64>().map(Va).map_err(|e| e.to_string())
+        }
+    }
 }
 
 // ── Display / Debug ───────────────────────────────────────────────────────────
@@ -120,6 +130,20 @@ impl VaRange {
     #[inline]
     pub fn is_empty(self) -> bool {
         self.start >= self.end
+    }
+
+    /// Construct a `VaRange` from optional lower/upper bounds.
+    ///
+    /// Returns `None` when both bounds are `None` (no constraint).
+    /// A missing lower bound defaults to `Va(0)`; a missing upper bound
+    /// defaults to `Va(u64::MAX)`.
+    pub fn from_bounds(lo: Option<Va>, hi: Option<Va>) -> Option<VaRange> {
+        match (lo, hi) {
+            (Some(lo), Some(hi)) => Some(VaRange::new(lo, hi)),
+            (Some(lo), None) => Some(VaRange::new(lo, Va(u64::MAX))),
+            (None, Some(hi)) => Some(VaRange::new(Va::ZERO, hi)),
+            (None, None) => None,
+        }
     }
 }
 

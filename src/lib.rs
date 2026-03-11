@@ -12,14 +12,12 @@ pub use pass::{Depth, PassConfig, PassResult, XrefPass};
 pub use va::{Va, VaRange};
 pub use xref::{Confidence, Xref, XrefKind};
 
-/// Parse a virtual address from a string.
+/// Parse a virtual address from a string, returning the raw `u64` value.
+///
 /// Accepts `0x`/`0X`-prefixed hexadecimal or plain decimal.
+/// Prefer [`Va::parse`] when a [`Va`] is needed directly.
 pub fn parse_va(s: &str) -> Result<u64, String> {
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16).map_err(|e| e.to_string())
-    } else {
-        s.parse::<u64>().map_err(|e| e.to_string())
-    }
+    Va::parse(s).map(Va::raw)
 }
 
 #[cfg(test)]

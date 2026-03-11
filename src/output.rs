@@ -6,6 +6,7 @@
 //!   3. Call `printer.print(&records)`.
 
 use crate::disasm::DisasmLine;
+use crate::va::Va;
 use crate::xref::{Confidence, XrefKind};
 use serde::Serialize;
 use std::fmt::Write as FmtWrite;
@@ -63,15 +64,15 @@ impl ContextLine {
 /// A fully resolved xref, optionally annotated with disasm context.
 #[derive(Serialize)]
 pub struct XrefRecord {
-    pub from: u64,
-    pub to: u64,
+    pub from: Va,
+    pub to: Va,
     /// Kind label (`"call"`, `"jump"`, `"data_read"`, `"data_write"`, `"data_ptr"`).
     #[serde(serialize_with = "serialize_kind")]
     pub kind: XrefKind,
     /// Confidence label (e.g. `"pair-resolved"`).
     #[serde(serialize_with = "serialize_confidence")]
     pub confidence: Confidence,
-    /// Present when `--verbose` was requested.
+    /// Present when `-A`/`-B` (after/before context) is non-zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<Vec<ContextLine>>,
 }
@@ -147,13 +148,12 @@ pub struct JsonlPrinter;
 
 impl Printer for JsonlPrinter {
     fn write_record(&self, r: &XrefRecord, buf: &mut Vec<u8>) {
-        match serde_json::to_string(r) {
-            Ok(s) => {
-                buf.extend_from_slice(s.as_bytes());
-                buf.push(b'\n');
-            }
-            Err(e) => eprintln!("json serialisation error: {e}"),
-        }
+        // XrefRecord contains only simple types (Va, XrefKind, Confidence,
+        // Option<Vec<ContextLine>>), so serialisation should never fail.
+        let s = serde_json::to_string(r)
+            .expect("XrefRecord serialisation should be infallible");
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(b'\n');
     }
 }
 

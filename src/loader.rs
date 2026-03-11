@@ -43,7 +43,13 @@ pub struct Segment {
     /// Virtual address of the segment start.
     pub va: Va,
     /// Raw bytes — a slice into the mmap (zero-copy).
-    pub data: &'static [u8],
+    ///
+    /// `pub(crate)` instead of `pub`: the `&'static` lifetime is a lie — the
+    /// backing allocation (mmap / `_bss_bufs`) lives only as long as
+    /// `LoadedBinary`. The public [`data()`](Segment::data) accessor returns
+    /// `&[u8]` tied to `&self`, preventing callers from holding the slice
+    /// beyond the segment's lifetime.
+    pub(crate) data: &'static [u8],
     /// Whether this segment contains executable code.
     pub executable: bool,
     /// Whether this segment contains readable data.
@@ -62,6 +68,14 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Raw byte data backing this segment.
+    ///
+    /// The returned reference is tied to `&self` rather than being `'static`,
+    /// so callers cannot outlive the owning [`LoadedBinary`].
+    pub fn data(&self) -> &[u8] {
+        self.data
+    }
+
     /// Byte slice at a given virtual address range, if within this segment.
     pub fn bytes_at(&self, va: Va, len: usize) -> Option<&[u8]> {
         let offset = va.raw().checked_sub(self.va.raw())? as usize;

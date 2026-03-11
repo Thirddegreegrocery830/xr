@@ -10,7 +10,7 @@
 //! values and resolve indirect CALL/JMP where the target is a known constant.
 //! This catches `mov rax, imm64; call rax` patterns.
 
-use super::{ScanRegion, SegmentDataIndex, SegmentIndex, XrefSet};
+use super::{ScanRegion, SegmentIndex, XrefSet};
 use crate::va::Va;
 use crate::xref::{Confidence, Xref, XrefKind};
 use iced_x86::{
@@ -35,17 +35,15 @@ fn mem_op_is_write(
     )
 }
 
-/// Depth 1: linear decode, immediate + RIP-relative targets.
 /// Depth 1: linear disassembly. Delegates to `scan_with_prop` — the register
 /// propagation adds negligible cost and the extra resolved xrefs are harmless
 /// (they're correct, just not required at depth 1).
 pub(crate) fn scan_linear(
     region: &ScanRegion,
     idx: &SegmentIndex,
-    _data_idx: &SegmentDataIndex,
     got_map: &HashMap<Va, Va>,
 ) -> XrefSet {
-    scan_with_prop(region, idx, _data_idx, got_map)
+    scan_with_prop(region, idx, got_map)
 }
 
 /// Depth 2: linear disassembly + simple register constant propagation.
@@ -53,7 +51,6 @@ pub(crate) fn scan_linear(
 pub(crate) fn scan_with_prop(
     region: &ScanRegion,
     idx: &SegmentIndex,
-    _data_idx: &SegmentDataIndex,
     got_map: &HashMap<Va, Va>,
 ) -> XrefSet {
     let mut xrefs = Vec::new();
@@ -285,6 +282,12 @@ fn emit_rip_relative(
     }
 }
 
+/// Maximum value for a sign-extended 32-bit immediate treated as an address.
+///
+/// Values at or above 4 GiB are sign-extension artefacts from `imm32to64`
+/// (e.g. `0xFFFF_FFFF_FFFF_FF80` from `CMP rax, -128`), not valid addresses.
+const IMM32_ADDR_MAX: u64 = 0x1_0000_0000;
+
 /// Extract a 32-bit immediate operand as a potential address value, for
 /// instruction types that IDA records as data_ptr when the immediate
 /// resolves to a mapped address.
@@ -304,56 +307,21 @@ fn imm_as_address(insn: &Instruction) -> Option<u64> {
         // MOV reg, imm64 — direct 64-bit pointer
         Code::Mov_r64_imm64 => {
             let v = insn.immediate64();
-            if v > 0 {
-                Some(v)
-            } else {
-                None
-            }
+            (v > 0).then_some(v)
         }
-        // MOV r/m64, imm32 or MOV r32, imm32 — zero/sign-extended 32-bit address
-        Code::Mov_rm64_imm32 | Code::Mov_r32_imm32 => {
+        // 32-bit immediates: MOV, CMP, SUB — zero/sign-extended address values
+        Code::Mov_rm64_imm32
+        | Code::Mov_r32_imm32
+        | Code::Cmp_rm64_imm32
+        | Code::Cmp_rm64_imm8
+        | Code::Cmp_RAX_imm32
+        | Code::Cmp_EAX_imm32
+        | Code::Sub_rm64_imm32
+        | Code::Sub_rm64_imm8
+        | Code::Sub_RAX_imm32
+        | Code::Sub_EAX_imm32 => {
             let v = insn.immediate32to64() as u64;
-            if v > 0 && v < 0x1_0000_0000 {
-                Some(v)
-            } else {
-                None
-            }
-        }
-        // CMP r/m64, imm32  (0x81 /7 with REX.W)
-        Code::Cmp_rm64_imm32 | Code::Cmp_rm64_imm8 => {
-            let v = insn.immediate32to64() as u64;
-            if v > 0 && v < 0x1_0000_0000 {
-                Some(v)
-            } else {
-                None
-            }
-        }
-        // CMP rAX, imm32  (0x3d with REX.W → Cmp_RAX_imm32)
-        Code::Cmp_RAX_imm32 | Code::Cmp_EAX_imm32 => {
-            let v = insn.immediate32to64() as u64;
-            if v > 0 && v < 0x1_0000_0000 {
-                Some(v)
-            } else {
-                None
-            }
-        }
-        // SUB r/m64, imm32  (0x81 /5 with REX.W)
-        Code::Sub_rm64_imm32 | Code::Sub_rm64_imm8 => {
-            let v = insn.immediate32to64() as u64;
-            if v > 0 && v < 0x1_0000_0000 {
-                Some(v)
-            } else {
-                None
-            }
-        }
-        // SUB rAX, imm32  (0x2d with REX.W)
-        Code::Sub_RAX_imm32 | Code::Sub_EAX_imm32 => {
-            let v = insn.immediate32to64() as u64;
-            if v > 0 && v < 0x1_0000_0000 {
-                Some(v)
-            } else {
-                None
-            }
+            (v > 0 && v < IMM32_ADDR_MAX).then_some(v)
         }
         _ => None,
     }
@@ -402,7 +370,10 @@ fn update_prop_state(insn: &Instruction, vals: &mut [Option<u64>; 16]) {
             vals[dst_idx] = Some(insn.immediate32() as u64);
         }
         Code::Mov_r16_imm16 => {
-            vals[dst_idx] = Some(insn.immediate16() as u64);
+            // MOV r16, imm16 writes only the lower 16 bits of the register;
+            // the upper 48 bits are preserved (unlike MOV r32 which zero-extends).
+            // We cannot know the full 64-bit value, so invalidate.
+            vals[dst_idx] = None;
         }
         // LEA r64, [rip+disp] — we know the value since RIP-relative is resolved
         Code::Lea_r64_m => {
@@ -446,7 +417,7 @@ fn gpr_index(reg: Register) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::{ScanRegion, SegmentDataIndex};
+    use crate::arch::ScanRegion;
     use crate::loader::{DecodeMode, Segment};
     use crate::xref::{Confidence, XrefKind};
     use std::collections::HashMap;
@@ -480,8 +451,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].from, Va(0x1000));
         assert_eq!(xrefs[0].to, Va(0x2000));
@@ -504,8 +474,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
         let jmp = xrefs.iter().find(|x| x.kind == XrefKind::Jump).unwrap();
         assert_eq!(jmp.from, Va(0x1005));
         assert_eq!(jmp.to, Va(0x2000));
@@ -527,8 +496,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
         let je = xrefs.iter().find(|x| x.kind == XrefKind::CondJump).unwrap();
         assert_eq!(je.from, Va(0x100a));
         assert_eq!(je.to, Va(0x2000));
@@ -547,8 +515,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
         // LEA = takes address → DataPointer (IDA dr_O), not DataRead
         let lea = xrefs
             .iter()
@@ -575,8 +542,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_with_prop(&region_for(&code), &idx, &didx, &HashMap::new());
+        let xrefs = scan_with_prop(&region_for(&code), &idx, &HashMap::new());
         let prop = xrefs
             .iter()
             .find(|x| x.confidence == Confidence::LocalProp)
@@ -595,8 +561,7 @@ mod tests {
         let code = fake_seg(0x1000, &CODE);
         let segs = vec![fake_seg(0x1000, &CODE)];
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
+        let xrefs = scan_linear(&region_for(&code), &idx, &HashMap::new());
         assert!(xrefs.is_empty());
     }
 }

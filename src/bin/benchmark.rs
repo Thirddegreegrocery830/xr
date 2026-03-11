@@ -22,7 +22,7 @@
 //! The comparison uses a KIND-AGNOSTIC (from, to) match as the primary
 //! signal, and also reports a strict (from, to, kind) match for reference.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +30,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::Instant;
 use xr::pass::PassConfig;
+use xr::va::Va;
 use xr::xref::{Xref, XrefKind};
 use xr::{Depth, LoadedBinary, XrefPass};
 
@@ -128,7 +129,7 @@ impl GroundTruth {
 }
 
 /// A (from, to) pair — used for kind-agnostic matching.
-type AddrPair = (u64, u64);
+type AddrPair = (Va, Va);
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
@@ -229,8 +230,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load ground truth
-    let gt_json = std::fs::read_to_string(&cli.ground_truth)?;
-    let gt: GroundTruth = serde_json::from_str(&gt_json)?;
+    let gt_json = std::fs::read_to_string(&cli.ground_truth)
+        .with_context(|| format!("reading {}", cli.ground_truth.display()))?;
+    let gt: GroundTruth = serde_json::from_str(&gt_json)
+        .with_context(|| format!("parsing {}", cli.ground_truth.display()))?;
     let ida_image_base = gt.image_base();
     let ida_raw = gt.xrefs();
 
@@ -263,7 +266,7 @@ fn main() -> Result<()> {
     }
 
     for x in ida_raw {
-        let pair = (x.from.wrapping_add(va_offset), x.to.wrapping_add(va_offset));
+        let pair = (Va(x.from.wrapping_add(va_offset)), Va(x.to.wrapping_add(va_offset)));
         ida_all.insert(pair);
         if let Some(kind) = XrefKind::from_name(&x.kind) {
             if let Some(set) = ida_by_kind.get_mut(&kind) {
@@ -289,7 +292,7 @@ fn main() -> Result<()> {
 
     let min_ref_va = cli
         .min_ref_va
-        .map(xr::Va)
+        .map(Va)
         .unwrap_or_else(|| binary.min_va());
     println!(
         "binary       : {}  arch={:?}  segments={}",
@@ -329,7 +332,7 @@ fn main() -> Result<()> {
         let mut xr_all: HashSet<AddrPair> = HashSet::new();
 
         for x in &xrefs {
-            let pair = (x.from.raw(), x.to.raw());
+            let pair = (x.from, x.to);
             xr_all.insert(pair);
             let k = x.kind.scored_kind();
             if let Some(set) = xr_by_kind.get_mut(&k) {
@@ -377,7 +380,7 @@ fn main() -> Result<()> {
         if depth == Depth::Paired {
             // Helper: build full xref vec filtered by kind for a given pair set
             let xref_map: std::collections::HashMap<AddrPair, &Xref> =
-                xrefs.iter().map(|x| ((x.from.raw(), x.to.raw()), x)).collect();
+                xrefs.iter().map(|x| ((x.from, x.to), x)).collect();
 
             let kind_filter = cli.dump_kind.as_deref().and_then(XrefKind::from_name);
 
@@ -398,32 +401,28 @@ fn main() -> Result<()> {
 
             #[derive(serde::Serialize)]
             struct DumpXref {
-                from: u64,
-                to: u64,
+                from: Va,
+                to: Va,
                 kind: &'static str,
             }
 
             let make_dump = |pairs: Vec<&AddrPair>| -> Vec<DumpXref> {
                 pairs
                     .into_iter()
-                    .map(|(f, t)| {
+                    .map(|&(f, t)| {
                         let kind = xref_map
-                            .get(&(*f, *t))
+                            .get(&(f, t))
                             .map(|x| x.kind.scored_kind().name())
                             .unwrap_or_else(|| {
                                 // FN: determine kind from IDA
                                 for &k in XrefKind::SCORED_KINDS {
-                                    if ida_by_kind[&k].contains(&(*f, *t)) {
+                                    if ida_by_kind[&k].contains(&(f, t)) {
                                         return k.name();
                                     }
                                 }
                                 "unknown"
                             });
-                        DumpXref {
-                            from: *f,
-                            to: *t,
-                            kind,
-                        }
+                        DumpXref { from: f, to: t, kind }
                     })
                     .collect()
             };

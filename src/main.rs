@@ -6,6 +6,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use xr::output::{ContextLine, CsvPrinter, JsonlPrinter, Printer, TextPrinter, XrefRecord};
 use xr::va::VaRange;
+use xr::xref::XrefKind;
 use xr::{parse_va, Depth, LoadedBinary, PassConfig, Va, XrefPass};
 
 /// Capacity for the stdout BufWriter (4 MiB).
@@ -48,10 +49,10 @@ struct Cli {
     #[arg(long)]
     min_ref_va: Option<u64>,
 
-    /// Filter output to xrefs of this kind (call/jump/data_read/data_write/data_ptr).
+    /// Filter output to xrefs of this kind.
     /// When omitted, all kinds are shown.
     #[arg(short = 'k', long)]
-    kind: Option<String>,
+    kind: Option<KindFilter>,
 
     /// Instructions of disasm context BEFORE each xref site (like grep -B).
     /// When non-zero, enables context display for that xref.
@@ -102,6 +103,31 @@ enum OutputFormat {
     Csv,
 }
 
+/// Scored xref kind filter — the five canonical categories that IDA reports.
+#[derive(Clone, Copy, ValueEnum)]
+enum KindFilter {
+    Call,
+    Jump,
+    #[value(name = "data_read")]
+    DataRead,
+    #[value(name = "data_write")]
+    DataWrite,
+    #[value(name = "data_ptr")]
+    DataPtr,
+}
+
+impl KindFilter {
+    fn to_scored_kind(self) -> XrefKind {
+        match self {
+            Self::Call => XrefKind::Call,
+            Self::Jump => XrefKind::Jump,
+            Self::DataRead => XrefKind::DataRead,
+            Self::DataWrite => XrefKind::DataWrite,
+            Self::DataPtr => XrefKind::DataPointer,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -125,18 +151,8 @@ fn main() -> Result<()> {
         .map(Va)
         .unwrap_or_else(|| binary.min_va());
 
-    let from_range = match (cli.start, cli.end) {
-        (Some(lo), Some(hi)) => Some(VaRange::new(Va(lo), Va(hi))),
-        (Some(lo), None) => Some(VaRange::new(Va(lo), Va(u64::MAX))),
-        (None, Some(hi)) => Some(VaRange::new(Va(0), Va(hi))),
-        (None, None) => None,
-    };
-    let to_range = match (cli.ref_start, cli.ref_end) {
-        (Some(lo), Some(hi)) => Some(VaRange::new(Va(lo), Va(hi))),
-        (Some(lo), None) => Some(VaRange::new(Va(lo), Va(u64::MAX))),
-        (None, Some(hi)) => Some(VaRange::new(Va(0), Va(hi))),
-        (None, None) => None,
-    };
+    let from_range = VaRange::from_bounds(cli.start.map(Va), cli.end.map(Va));
+    let to_range = VaRange::from_bounds(cli.ref_start.map(Va), cli.ref_end.map(Va));
 
     let config = PassConfig {
         depth,
@@ -156,7 +172,7 @@ fn main() -> Result<()> {
     // Context is enabled whenever -A or -B is non-zero (like grep).
     let want_context = cli.before > 0 || cli.after > 0;
 
-    let kind_filter = cli.kind.clone();
+    let kind_filter = cli.kind;
     let limit = cli.limit;
     let mut emitted = 0usize;
 
@@ -212,9 +228,10 @@ fn main() -> Result<()> {
                                 .iter()
                                 .find(|s| s.contains(x.from))
                                 .map(|seg| {
+                                    let data = seg.data();
                                     let off = (x.from - seg.va) as usize;
-                                    let len = 8.min(seg.data.len().saturating_sub(off));
-                                    vec![ContextLine::data(x.from.raw(), &seg.data[off..off + len])]
+                                    let len = 8.min(data.len().saturating_sub(off));
+                                    vec![ContextLine::data(x.from.raw(), &data[off..off + len])]
                                 })
                                 .unwrap_or_default()
                         } else {
@@ -224,8 +241,8 @@ fn main() -> Result<()> {
                         None
                     };
                     let record = XrefRecord {
-                        from: x.from.raw(),
-                        to: x.to.raw(),
+                        from: x.from,
+                        to: x.to,
                         kind: x.kind,
                         confidence: x.confidence,
                         context,
@@ -241,7 +258,7 @@ fn main() -> Result<()> {
 
         let candidates: Vec<_> = batch
             .iter()
-            .filter(|x| kind_filter.as_deref().is_none_or(|k| x.kind.name() == k))
+            .filter(|x| kind_filter.is_none_or(|k| x.kind.scored_kind() == k.to_scored_kind()))
             .take(remaining)
             .collect();
 

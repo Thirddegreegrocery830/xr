@@ -242,6 +242,34 @@ fn disasm_arm64(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Ve
     build_window(all, focus_va, before, after)
 }
 
+// ── Shared window builder ─────────────────────────────────────────────────────
+
+fn build_window(
+    all: Vec<(u64, Vec<u8>, String)>,
+    focus_va: u64,
+    before: usize,
+    after: usize,
+) -> Vec<DisasmLine> {
+    let focus_idx = match all.iter().position(|(va, _, _)| *va == focus_va) {
+        Some(i) => i,
+        // focus_va not cleanly decoded (e.g. mid-instruction on x86) — no output.
+        None => return vec![],
+    };
+
+    let start = focus_idx.saturating_sub(before);
+    let end = (focus_idx + after + 1).min(all.len());
+
+    all[start..end]
+        .iter()
+        .map(|(va, bytes, text)| DisasmLine {
+            va: *va,
+            bytes: bytes.clone(),
+            text: text.clone(),
+            is_focus: *va == focus_va,
+        })
+        .collect()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -458,32 +486,4 @@ mod tests {
             "focus bytes must be the full 5-byte CALL encoding"
         );
     }
-}
-
-// ── Shared window builder ─────────────────────────────────────────────────────
-
-fn build_window(
-    all: Vec<(u64, Vec<u8>, String)>,
-    focus_va: u64,
-    before: usize,
-    after: usize,
-) -> Vec<DisasmLine> {
-    let focus_idx = match all.iter().position(|(va, _, _)| *va == focus_va) {
-        Some(i) => i,
-        // focus_va not cleanly decoded (e.g. mid-instruction on x86) — no output.
-        None => return vec![],
-    };
-
-    let start = focus_idx.saturating_sub(before);
-    let end = (focus_idx + after + 1).min(all.len());
-
-    all[start..end]
-        .iter()
-        .map(|(va, bytes, text)| DisasmLine {
-            va: *va,
-            bytes: bytes.clone(),
-            text: text.clone(),
-            is_focus: *va == focus_va,
-        })
-        .collect()
 }

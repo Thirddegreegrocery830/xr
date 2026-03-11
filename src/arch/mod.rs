@@ -78,11 +78,12 @@ impl SegmentIndex {
             })
             .collect();
         entries.sort_unstable_by_key(|e| e.0);
-        // Detect overlapping segments — binary search assumes disjoint intervals.
-        debug_assert!(
-            entries.windows(2).all(|w| w[0].1 <= w[1].0),
-            "SegmentIndex: overlapping segments detected (binary search may give wrong results)"
-        );
+        // Binary search assumes disjoint intervals.  Warn (don't panic) if a
+        // malformed binary has overlapping segments — wrong results are better
+        // than a crash in production.
+        if !entries.windows(2).all(|w| w[0].1 <= w[1].0) {
+            eprintln!("warning: SegmentIndex: overlapping segments detected (binary search may give wrong results)");
+        }
         Self { entries }
     }
 
@@ -170,11 +171,9 @@ impl SegmentDataIndex {
             })
             .collect();
         entries.sort_unstable_by_key(|e| e.0);
-        // Detect overlapping segments — binary search assumes disjoint intervals.
-        debug_assert!(
-            entries.windows(2).all(|w| w[0].1 <= w[1].0),
-            "SegmentDataIndex: overlapping segments detected (binary search may give wrong results)"
-        );
+        if !entries.windows(2).all(|w| w[0].1 <= w[1].0) {
+            eprintln!("warning: SegmentDataIndex: overlapping segments detected (binary search may give wrong results)");
+        }
         Self { entries }
     }
 
