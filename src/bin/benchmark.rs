@@ -231,8 +231,12 @@ fn run_pass(
 ///
 /// Uses `iced-x86` for correct decoding (handles REX prefixes, segment
 /// overrides, and other encoding variants that raw byte matching misses).
+/// Decode the instruction at `from_va` and return the RIP-relative memory
+/// target, if any.  This handles:
+///   - `CALL [RIP+disp]` / `JMP [RIP+disp]` (GOT/IAT indirect call/jump)
+///   - `MOV reg, [RIP+disp]` / `CMP [RIP+disp], imm` etc (IAT data access)
 fn resolve_x86_got_slot(binary: &LoadedBinary, from_va: Va) -> Option<Va> {
-    use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind, Register};
+    use iced_x86::{Decoder, DecoderOptions, OpKind, Register};
 
     let seg = binary.segment_at(from_va)?;
     let offset = (from_va.raw() - seg.va.raw()) as usize;
@@ -249,19 +253,20 @@ fn resolve_x86_got_slot(binary: &LoadedBinary, from_va: Va) -> Option<Va> {
         return None;
     }
 
-    // Must be an indirect call or jump through RIP-relative memory.
-    let fc = insn.flow_control();
-    if !matches!(fc, FlowControl::IndirectCall | FlowControl::IndirectBranch) {
-        return None;
+    // Check every operand for RIP-relative memory access.
+    for i in 0..insn.op_count() {
+        let kind = match i {
+            0 => insn.op0_kind(),
+            1 => insn.op1_kind(),
+            2 => insn.op2_kind(),
+            3 => insn.op3_kind(),
+            _ => break,
+        };
+        if kind == OpKind::Memory && insn.memory_base() == Register::RIP {
+            return Some(Va::new(insn.memory_displacement64()));
+        }
     }
-    if insn.op_count() >= 1
-        && insn.op0_kind() == OpKind::Memory
-        && insn.memory_base() == Register::RIP
-    {
-        Some(Va::new(insn.memory_displacement64()))
-    } else {
-        None
-    }
+    None
 }
 
 /// Compute the "extern bound": the highest VA at the end of any mapped segment.
@@ -332,11 +337,16 @@ fn main() -> Result<()> {
         let from = Va::new(x.from.wrapping_add(va_offset));
         let mut to = Va::new(x.to.wrapping_add(va_offset));
 
-        // Normalize IDA extern-target call/jump xrefs to GOT slot VAs.
-        if to.raw() >= ext_bound
-            && (x.kind == "call" || x.kind == "jump")
-            && binary.arch == Arch::X86_64
-        {
+        // Normalize IDA extern-target xrefs to GOT/IAT slot VAs.
+        //
+        // IDA records references to imported symbols using synthetic "extern"
+        // VAs that don't exist in the binary.  xr emits the real GOT/IAT slot
+        // VA instead.  To make them comparable we decode the instruction at
+        // `from` and extract the RIP-relative memory target.
+        //
+        // ELF: call/jump through GOT (CALL [RIP+disp] / JMP [RIP+disp]).
+        // PE:  data_read/data_write through IAT (MOV reg, [RIP+disp] etc).
+        if to.raw() >= ext_bound && binary.arch == Arch::X86_64 {
             if let Some(got_va) = resolve_x86_got_slot(&binary, from) {
                 to = got_va;
                 extern_normalized += 1;

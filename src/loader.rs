@@ -1066,6 +1066,7 @@ fn parse_pe(
     }
 
     let reloc_pointers = build_pe_reloc_pointers(bytes, pe, image_base, &segments);
+    let got_slots = build_pe_iat_slots(pe, image_base);
 
     Ok(ParseResult {
         arch,
@@ -1073,9 +1074,23 @@ fn parse_pe(
         entry_points,
         symbols,
         pie_base: 0,
-        got_slots: FxHashSet::default(),
+        got_slots,
         reloc_pointers,
     })
+}
+
+/// Build the set of IAT (Import Address Table) slot VAs for a PE binary.
+///
+/// Each PE import has an IAT entry that the loader patches at runtime with the
+/// resolved address. Code references these via `call [rip+disp]` /
+/// `jmp [rip+disp]` (x86-64) or `ldr Xn, [IAT_slot]; blr Xn` (ARM64).
+/// This is the PE equivalent of ELF's GOT slots from GLOB_DAT / JUMP_SLOT.
+fn build_pe_iat_slots(pe: &goblin::pe::PE, image_base: u64) -> FxHashSet<Va> {
+    let mut slots = FxHashSet::default();
+    for import in &pe.imports {
+        slots.insert(Va::new(image_base + import.rva as u64));
+    }
+    slots
 }
 
 /// Extract relocation-derived pointer pairs from PE base relocation table.
