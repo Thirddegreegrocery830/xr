@@ -18,6 +18,20 @@ use iced_x86::{
     OpKind, Register,
 };
 use std::collections::HashSet;
+
+/// Tracks a register participating in a jump table dispatch.
+///
+/// Populated by `update_jt_state` when recognising the MOVSXD+ADD pattern,
+/// consumed by `recover_jump_table` on the JMP instruction.
+#[derive(Clone, Copy)]
+struct JumpTableInfo {
+    /// VA of the first table entry (base_reg_val + displacement).
+    table_start: Va,
+    /// Value added to each i32 offset to compute the target (the LEA result).
+    target_base: Va,
+    /// Upper bound from CMP+JA (None = unknown, use fallback).
+    max_entries: Option<u32>,
+}
 /// Returns true if the memory operand at `op_idx` in `insn` is written to (not just read).
 /// Uses InstructionInfoFactory for accurate semantics (handles CMP, TEST, ADD [mem], etc.).
 #[inline]
@@ -64,13 +78,7 @@ pub(crate) fn scan_with_prop(
     // Track known constant values per register (GPRs 0..16 for RAX..R15)
     let mut reg_vals: [Option<u64>; 16] = [None; 16];
 
-    // Jump table state: tracks registers that hold a value loaded from a
-    // jump table (via MOVSXD [base + idx*4]) and propagated through ADD.
-    // (table_start, target_base, max_entries) where:
-    //   table_start  = VA of the first table entry (base_reg_val + disp)
-    //   target_base  = value added to each i32 offset to compute the target
-    //   max_entries  = upper bound from CMP+JA pattern (None = unknown)
-    let mut jt_info: [Option<(u64, u64, Option<u32>)>; 16] = [None; 16];
+    let mut jt_info: [Option<JumpTableInfo>; 16] = [None; 16];
 
     // CMP bound tracking: when `CMP rN, imm` is seen, record `imm+1` as the
     // maximum number of valid table entries for register N. Propagated through
@@ -119,12 +127,10 @@ pub(crate) fn scan_with_prop(
                         } else if insn.code() == Code::Jmp_rm64 {
                             // Jump table recovery: if the register was loaded
                             // from a table via MOVSXD+ADD, read all entries.
-                            if let Some((table_start, target_base, max_entries)) = jt_info[ri] {
+                            if let Some(jt) = jt_info[ri] {
                                 recover_jump_table(
-                                    va,
-                                    table_start,
-                                    target_base,
-                                    max_entries,
+                                    Va(va),
+                                    jt,
                                     data_idx,
                                     idx,
                                     &mut xrefs,
@@ -392,7 +398,7 @@ fn update_jt_state(
     insn: &Instruction,
     reg_vals: &[Option<u64>; 16],
     cmp_bound: &[Option<u32>; 16],
-    jt_info: &mut [Option<(u64, u64, Option<u32>)>; 16],
+    jt_info: &mut [Option<JumpTableInfo>; 16],
 ) {
     if insn.op_count() == 0 || insn.op0_kind() != OpKind::Register {
         return;
@@ -406,11 +412,16 @@ fn update_jt_state(
             if insn.memory_index() != Register::None && insn.memory_index_scale() == 4 {
                 if let Some(bi) = gpr_index(insn.memory_base()) {
                     if let Some(base_val) = reg_vals[bi] {
-                        let table_start = base_val.wrapping_add(insn.memory_displacement64());
+                        let table_start =
+                            Va(base_val.wrapping_add(insn.memory_displacement64()));
                         // Look up the CMP bound for the index register
-                        let max_entries = gpr_index(insn.memory_index())
-                            .and_then(|ii| cmp_bound[ii]);
-                        jt_info[di] = Some((table_start, base_val, max_entries));
+                        let max_entries =
+                            gpr_index(insn.memory_index()).and_then(|ii| cmp_bound[ii]);
+                        jt_info[di] = Some(JumpTableInfo {
+                            table_start,
+                            target_base: Va(base_val),
+                            max_entries,
+                        });
                         return;
                     }
                 }
@@ -427,17 +438,16 @@ fn update_jt_state(
         {
             let src = insn.op1_register();
             if let Some(si) = gpr_index(src) {
-                if let Some((_, target_base, _)) = jt_info[di] {
+                if let Some(info) = jt_info[di] {
                     // dst had the table offset; verify src is the base register
-                    if reg_vals[si] == Some(target_base) {
+                    if reg_vals[si] == Some(info.target_base.raw()) {
                         // jt_info[di] stays — dst is now offset + base = target
                     } else {
                         jt_info[di] = None;
                     }
                 } else if let Some(info) = jt_info[si] {
                     // src had the table offset; verify dst is the base register
-                    let (_, target_base, _) = info;
-                    if reg_vals[di] == Some(target_base) {
+                    if reg_vals[di] == Some(info.target_base.raw()) {
                         jt_info[di] = Some(info);
                     } else {
                         jt_info[di] = None;
@@ -542,21 +552,19 @@ const FALLBACK_TABLE_LIMIT: usize = 0;
 ///     and the size is capped at a small fallback.
 ///   - Always stops on the first entry that doesn't resolve to an exec address.
 fn recover_jump_table(
-    jmp_va: u64,
-    table_start: u64,
-    target_base: u64,
-    max_entries: Option<u32>,
+    jmp_va: Va,
+    jt: JumpTableInfo,
     data_idx: &SegmentDataIndex,
     seg_idx: &SegmentIndex,
     xrefs: &mut Vec<Xref>,
 ) {
-    let limit = match max_entries {
+    let limit = match jt.max_entries {
         Some(n) => (n as usize).min(MAX_JUMP_TABLE_ENTRIES),
         None => {
             // Without a CMP bound, require data in a non-exec segment.
             // Dead-code LEA+MOVSXD+ADD+JMP patterns in .text would reference
             // .text data that looks like valid offsets, producing many FPs.
-            let flags = data_idx.flags_at(Va(table_start));
+            let flags = data_idx.flags_at(jt.table_start);
             if flags.is_none_or(|f| f & super::FLAG_EXEC != 0) {
                 return;
             }
@@ -564,17 +572,17 @@ fn recover_jump_table(
         }
     };
     for i in 0..limit {
-        let slot_va = table_start.wrapping_add((i as u64) * 4);
-        let Some(offset) = data_idx.read_i32_at(Va(slot_va)) else {
+        let slot_va = jt.table_start + (i as u64) * 4;
+        let Some(offset) = data_idx.read_i32_at(slot_va) else {
             break;
         };
-        let target = (target_base as i64).wrapping_add(offset as i64) as u64;
-        if !seg_idx.is_exec(Va(target)) {
+        let target = Va((jt.target_base.raw() as i64).wrapping_add(offset as i64) as u64);
+        if !seg_idx.is_exec(target) {
             break;
         }
         xrefs.push(Xref {
-            from: Va(jmp_va),
-            to: Va(target),
+            from: jmp_va,
+            to: target,
             kind: XrefKind::Jump,
             confidence: Confidence::LocalProp,
         });

@@ -1068,10 +1068,11 @@ fn build_pe_reloc_pointers(
 
     let mut result = Vec::new();
 
+    const IMAGE_REL_BASED_DIR64: u16 = 10;
+
     // Parse the base relocation table.
     // Each block: 4-byte page RVA, 4-byte block size, then 2-byte entries.
     // Entry: top 4 bits = type, bottom 12 bits = offset within the page.
-    // Type 10 = IMAGE_REL_BASED_DIR64 (64-bit pointer).
     let reloc_dir = pe
         .header
         .optional_header
@@ -1115,8 +1116,7 @@ fn build_pe_reloc_pointers(
                     );
                     let rel_type = entry >> 12;
                     let offset = entry & 0x0FFF;
-                    // Type 10 = IMAGE_REL_BASED_DIR64
-                    if rel_type == 10 {
+                    if rel_type == IMAGE_REL_BASED_DIR64 {
                         let slot_rva = page_rva + offset as u32;
                         let slot_va = image_base + slot_rva as u64;
                         if let Some(ptr_val) = read_ptr_at_rva(slot_rva) {

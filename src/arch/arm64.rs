@@ -24,6 +24,25 @@ use crate::xref::{Confidence, Xref, XrefKind};
 // Larger window catches more but also more false positives from dead registers.
 const ADRP_WINDOW: usize = 8;
 
+/// State tracked per register during the ADRP sliding-window scan.
+///
+/// Populated when an ADRP/ADR/ADD/LDR sets a register to a known address,
+/// consumed by completing instructions (ADD, LDR, STR, BLR, BR).
+#[derive(Clone, Copy)]
+struct AdrpRegState {
+    /// Instruction index when this value was set (for window distance check).
+    insn_index: usize,
+    /// VA of the ADRP (or ADR/LDR for chained entries) — xrefs are emitted
+    /// with `from = origin_va` to match IDA's convention.
+    origin_va: Va,
+    /// The resolved page address (ADRP) or full address (ADR/ADD/LDR chain).
+    value: Va,
+    /// True if this came from a LDR pointer-follow (chained resolution).
+    /// Chained values are data pointers, NOT callable/jumpable addresses —
+    /// BLR/BR must not resolve through a chain.
+    is_chain: bool,
+}
+
 /// Depth 1: linear scan, immediate targets only.
 /// No register tracking. Fast, no false positives on immediate targets.
 pub(crate) fn scan_linear(
@@ -70,18 +89,7 @@ pub(crate) fn scan_adrp(
 
     let n = data.len() / 4;
 
-    // Sliding window: for each register, track the most recent ADRP or chained-LDR
-    // value that set it.
-    // Key: register number (0-30, 31=XZR/SP — we ignore XZR).
-    // Value: (insn_index, origin_va, page_or_value, is_chain)
-    //   - insn_index: instruction index when the value was set
-    //   - origin_va: ADRP VA (for real ADRP entries) or LDR VA (for chained entries)
-    //   - page_or_value: the resolved address/value
-    //   - is_chain: true if this came from a LDR pointer-follow (NOT usable for BLR/BR)
-    //
-    // IDA records data_ptr xrefs with from=ADRP_VA (not the completing insn).
-    // We store the origin VA so we can emit at the right address.
-    let mut adrp_state: [Option<(usize, u64, u64, bool)>; 32] = [None; 32];
+    let mut adrp_state: [Option<AdrpRegState>; 32] = [None; 32];
 
     for i in 0..n {
         let offset = i * 4;
@@ -108,14 +116,15 @@ pub(crate) fn scan_adrp(
         // Second: ADRP tracking
         match insn {
             Arm64Insn::Adrp(_) => {
-                // ADRP Xn, #imm
-                // Sets Xn to (PC & ~0xFFF) + (imm << 12)
-                // We store (insn_index, adrp_va, page_value) so the completing
-                // instruction can emit from=ADRP_VA (matching IDA's convention).
                 let rd = insn.rd() as usize;
                 if rd < 31 {
                     let page = insn.adrp_page(va);
-                    adrp_state[rd] = Some((i, va, page, false));
+                    adrp_state[rd] = Some(AdrpRegState {
+                        insn_index: i,
+                        origin_va: Va(va),
+                        value: Va(page),
+                        is_chain: false,
+                    });
                 }
             }
 
@@ -127,42 +136,39 @@ pub(crate) fn scan_adrp(
                 let rd = insn.rd() as usize;
                 if rd < 31 {
                     let target = insn.adr_target(va);
-                    // Store with adrp_va = va (the ADR instruction itself).
-                    // is_chain=false so BLR/BR can use it.
-                    adrp_state[rd] = Some((i, va, target, false));
+                    adrp_state[rd] = Some(AdrpRegState {
+                        insn_index: i,
+                        origin_va: Va(va),
+                        value: Va(target),
+                        is_chain: false,
+                    });
                 }
             }
 
             Arm64Insn::AddImm(_) => {
                 // ADD Xd, Xn, #imm  — completes ADRP+ADD pairs.
-                //
-                // IDA records data_ptr at the ADRP VA (primary) and sometimes at the
-                // ADD VA (secondary). Analysis shows that emitting the secondary ADD-VA
-                // xref causes ~6981 FPs for only ~454 TPs gained. The FPs arise because
-                // IDA only emits ADD-VA when the target is a named/symbolic address —
-                // a condition we can't determine without IDA's symbol database. So we
-                // emit ONLY at ADRP_VA (matching the primary convention), not at ADD_VA.
+                // Emits data_ptr at ADRP VA only (not ADD VA — ~6981 FPs vs ~454 TPs).
                 let rd = insn.rd() as usize;
                 let rn = insn.rn() as usize;
                 if rn < 31 {
-                    if let Some((adrp_i, adrp_va, page, _chain)) = adrp_state[rn] {
-                        if i - adrp_i <= ADRP_WINDOW {
-                            let offset_val = insn.add_imm();
-                            let target = page.wrapping_add(offset_val);
-                            if idx.contains(Va(target)) {
-                                // Emit only at ADRP VA (IDA's primary convention).
-                                // Do NOT emit at ADD VA — analysis shows this causes
-                                // massive FPs (~6981) vs minimal TP gain (~454).
+                    if let Some(st) = adrp_state[rn] {
+                        if i - st.insn_index <= ADRP_WINDOW {
+                            let target = st.value + insn.add_imm();
+                            if idx.contains(target) {
                                 xrefs.push(Xref {
-                                    from: Va(adrp_va),
-                                    to: Va(target),
+                                    from: st.origin_va,
+                                    to: target,
                                     kind: XrefKind::DataPointer,
                                     confidence: Confidence::PairResolved,
                                 });
                             }
-                            // Update state: dst_reg now holds the resolved addr.
                             if rd < 31 {
-                                adrp_state[rd] = Some((i, adrp_va, target, false));
+                                adrp_state[rd] = Some(AdrpRegState {
+                                    insn_index: i,
+                                    origin_va: st.origin_va,
+                                    value: target,
+                                    is_chain: false,
+                                });
                             }
                             if rd != rn {
                                 adrp_state[rn] = None;
@@ -174,15 +180,6 @@ pub(crate) fn scan_adrp(
 
             Arm64Insn::Ldr(_) => {
                 // LDR Xt/Wt/Ht/Bt, [Xm, #imm]  — completes ADRP+LDR pairs.
-                //
-                // For 64-bit loads, IDA emits:
-                //   1. data_ptr at ADRP_VA, to=addr  (the ADRP points to the page)
-                //   2. data_read at LDR_VA, to=addr  (reading from the slot)
-                //   3. data_ptr at LDR_VA, to=*(addr) (pointer-follow, 64-bit only)
-                //
-                // For sub-64-bit loads (LDRW/LDRH/LDRB), IDA emits data_ptr + data_read
-                // but no pointer-follow (loaded value is not a valid 64-bit pointer).
-                //
                 // IMPORTANT: snapshot adrp_state[rn] BEFORE clearing adrp_state[rt],
                 // because Rt == Rn is common (e.g. `ADRP X0, page; LDR X0, [X0, #off]`).
 
@@ -190,45 +187,37 @@ pub(crate) fn scan_adrp(
                 let rn = insn.rn() as usize;
                 let is_64bit = insn.ldr_str_size() == 3;
 
-                // Snapshot the base register's ADRP state before any invalidation.
                 let base_state = if rn < 31 { adrp_state[rn] } else { None };
-
-                // Clear Rt — LDR overwrites the destination register.
-                // (Refined to the loaded value inside the resolved branch below.)
                 if rt < 31 {
                     adrp_state[rt] = None;
                 }
 
-                if let Some((adrp_i, adrp_va, page, _chain)) = base_state {
-                    if i - adrp_i <= ADRP_WINDOW {
-                        let addr = page.wrapping_add(insn.ldr_str_offset());
-                        let addr_is_exec = idx.is_exec(Va(addr));
+                if let Some(st) = base_state {
+                    if i - st.insn_index <= ADRP_WINDOW {
+                        let addr = st.value + insn.ldr_str_offset();
+                        let addr_is_exec = idx.is_exec(addr);
 
-                        // ADRP → data_ptr to target address (matching IDA's data_ptr at ADRP)
-                        if idx.contains(Va(addr)) {
+                        if idx.contains(addr) {
+                            // data_ptr at ADRP VA
                             xrefs.push(Xref {
-                                from: Va(adrp_va),
-                                to: Va(addr),
+                                from: st.origin_va,
+                                to: addr,
                                 kind: XrefKind::DataPointer,
                                 confidence: Confidence::PairResolved,
                             });
-                        }
-
-                        if idx.contains(Va(addr)) {
-                            // data_read at LDR_va → resolved address (IDA dr_R).
+                            // data_read at LDR VA
                             xrefs.push(Xref {
                                 from: Va(va),
-                                to: Va(addr),
+                                to: addr,
                                 kind: XrefKind::DataRead,
                                 confidence: Confidence::PairResolved,
                             });
                         }
 
                         // Pointer-follow: only for 64-bit loads from non-exec segments.
-                        // Sub-64-bit loads produce truncated values, not valid pointers.
                         let stored_val: Option<u64> = if is_64bit && !addr_is_exec {
                             data_idx
-                                .read_u64_at_nonexec(Va(addr))
+                                .read_u64_at_nonexec(addr)
                                 .filter(|&v| v != 0 && idx.contains(Va(v)))
                         } else {
                             None
@@ -241,12 +230,13 @@ pub(crate) fn scan_adrp(
                                 kind: XrefKind::DataPointer,
                                 confidence: Confidence::PairResolved,
                             });
-                        }
-
-                        // Propagate loaded value for chained resolution (64-bit only).
-                        if let Some(v) = stored_val {
                             if rt < 31 {
-                                adrp_state[rt] = Some((i, va, v, true));
+                                adrp_state[rt] = Some(AdrpRegState {
+                                    insn_index: i,
+                                    origin_va: Va(va),
+                                    value: Va(v),
+                                    is_chain: true,
+                                });
                             }
                         }
                     }
@@ -255,23 +245,18 @@ pub(crate) fn scan_adrp(
 
             Arm64Insn::Str(_) => {
                 // STR Xn, [Xm, #imm]  — data write via ADRP-resolved address.
-                // IDA classifies stores as data_write (dr_W).
-                // Suppress if target is executable (IDA doesn't record these).
                 let rn = insn.rn() as usize;
                 if rn < 31 {
-                    if let Some((adrp_i, _adrp_va, page, _chain)) = adrp_state[rn] {
-                        if i - adrp_i <= ADRP_WINDOW {
-                            let addr = page.wrapping_add(insn.ldr_str_offset());
-                            // Suppress writes to exec or read-only segments: IDA doesn't record
-                            // data_write to .text or .rodata. Only writable data segments matter.
-                            // A segment is writable iff FLAG_WRITE is set and FLAG_EXEC is clear.
-                            let is_writable_data = idx.flags_at(Va(addr)).is_some_and(|f| {
+                    if let Some(st) = adrp_state[rn] {
+                        if i - st.insn_index <= ADRP_WINDOW {
+                            let addr = st.value + insn.ldr_str_offset();
+                            let is_writable_data = idx.flags_at(addr).is_some_and(|f| {
                                 f & super::FLAG_WRITE != 0 && f & super::FLAG_EXEC == 0
                             });
                             if is_writable_data {
                                 xrefs.push(Xref {
                                     from: Va(va),
-                                    to: Va(addr),
+                                    to: addr,
                                     kind: XrefKind::DataWrite,
                                     confidence: Confidence::PairResolved,
                                 });
@@ -282,21 +267,14 @@ pub(crate) fn scan_adrp(
             }
 
             Arm64Insn::Blr(_) => {
-                // BLR Xn — indirect call, try to resolve from ADRP state.
-                // Only resolve if the register value came from a real ADRP (not a chain),
-                // since chained values are data pointers, not callable addresses.
-                //
-                // Only emit if the target is an executable internal address.
-                // Extern VA resolution (via got_map) is intentionally NOT done here:
-                // IDA's extern VA assignment order does not match dynsym sequence order,
-                // so got_map-derived extern VAs produce wrong targets and pure FPs.
+                // BLR Xn — indirect call via ADRP-resolved address (non-chain only).
                 let rn = insn.rn() as usize;
                 if rn < 31 {
-                    if let Some((adrp_i, _adrp_va, target, is_chain)) = adrp_state[rn] {
-                        if !is_chain && i - adrp_i <= ADRP_WINDOW && idx.is_exec(Va(target)) {
+                    if let Some(st) = adrp_state[rn] {
+                        if !st.is_chain && i - st.insn_index <= ADRP_WINDOW && idx.is_exec(st.value) {
                             xrefs.push(Xref {
                                 from: Va(va),
-                                to: Va(target),
+                                to: st.value,
                                 kind: XrefKind::Call,
                                 confidence: Confidence::PairResolved,
                             });
@@ -306,16 +284,14 @@ pub(crate) fn scan_adrp(
             }
 
             Arm64Insn::Br(_) => {
-                // BR Xn — indirect jump, try to resolve (only non-chain values).
-                // Require the target to be an executable internal address.
-                // Extern VA resolution is intentionally NOT done here (same reason as BLR).
+                // BR Xn — indirect jump via ADRP-resolved address (non-chain only).
                 let rn = insn.rn() as usize;
                 if rn < 31 {
-                    if let Some((adrp_i, _adrp_va, target, is_chain)) = adrp_state[rn] {
-                        if !is_chain && i - adrp_i <= ADRP_WINDOW && idx.is_exec(Va(target)) {
+                    if let Some(st) = adrp_state[rn] {
+                        if !st.is_chain && i - st.insn_index <= ADRP_WINDOW && idx.is_exec(st.value) {
                             xrefs.push(Xref {
                                 from: Va(va),
-                                to: Va(target),
+                                to: st.value,
                                 kind: XrefKind::Jump,
                                 confidence: Confidence::PairResolved,
                             });
