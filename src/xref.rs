@@ -1,10 +1,12 @@
+use crate::va::Va;
+
 /// A resolved cross-reference between two addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Xref {
     /// Address of the instruction that generates this reference.
-    pub from: u64,
+    pub from: Va,
     /// Target address being referenced.
-    pub to: u64,
+    pub to: Va,
     /// What kind of reference this is.
     pub kind: XrefKind,
     /// How confident we are in this xref's correctness.

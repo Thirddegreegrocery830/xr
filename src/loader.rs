@@ -1,3 +1,4 @@
+use crate::va::Va;
 use anyhow::{anyhow, Result};
 use dylex::DyldContext;
 use goblin::Object;
@@ -32,7 +33,7 @@ pub enum DecodeMode {
 #[derive(Debug, Clone)]
 pub struct Segment {
     /// Virtual address of the segment start.
-    pub va: u64,
+    pub va: Va,
     /// Raw bytes — a slice into the mmap (zero-copy).
     pub data: &'static [u8],
     /// Whether this segment contains executable code.
@@ -54,18 +55,18 @@ pub struct Segment {
 
 impl Segment {
     /// Byte slice at a given virtual address range, if within this segment.
-    pub fn bytes_at(&self, va: u64, len: usize) -> Option<&[u8]> {
-        let offset = va.checked_sub(self.va)? as usize;
+    pub fn bytes_at(&self, va: Va, len: usize) -> Option<&[u8]> {
+        let offset = va.raw().checked_sub(self.va.raw())? as usize;
         self.data.get(offset..offset + len)
     }
 
     /// VA range covered by this segment.
-    pub fn va_range(&self) -> Range<u64> {
+    pub fn va_range(&self) -> Range<Va> {
         self.va..self.va + self.data.len() as u64
     }
 
     /// True if the given VA falls within this segment.
-    pub fn contains(&self, va: u64) -> bool {
+    pub fn contains(&self, va: Va) -> bool {
         self.va_range().contains(&va)
     }
 }
@@ -79,9 +80,9 @@ pub struct LoadedBinary {
     /// All mapped segments (code + data).
     pub segments: Vec<Segment>,
     /// Entry points / known function seeds.
-    pub entry_points: Vec<u64>,
+    pub entry_points: Vec<Va>,
     /// Exports / named symbols with their addresses.
-    pub symbols: Vec<(String, u64)>,
+    pub symbols: Vec<(String, Va)>,
     /// Non-zero if this is a PIE ELF that was rebased by the loader.
     /// All segment VAs, entry points, and symbols have already had this
     /// value added. 0 for non-PIE binaries and non-ELF formats.
@@ -94,7 +95,7 @@ pub struct LoadedBinary {
     ///
     /// Populated by `build_elf_got_map` for ELF PIE binaries.  Empty for Mach-O,
     /// PE, and non-PIE ELF (where GOT-indirect calls target resolved addresses).
-    pub got_map: HashMap<u64, u64>,
+    pub got_map: HashMap<Va, Va>,
     /// The underlying mmap — kept alive here.
     _mmap: Mmap,
     /// Zero-filled BSS buffers allocated by the loader.
@@ -193,17 +194,17 @@ impl LoadedBinary {
     }
 
     /// Find the segment containing a given virtual address.
-    pub fn segment_at(&self, va: u64) -> Option<&Segment> {
+    pub fn segment_at(&self, va: Va) -> Option<&Segment> {
         self.segments.iter().find(|s| s.contains(va))
     }
 
     /// True if the given VA is in any mapped segment.
-    pub fn is_mapped(&self, va: u64) -> bool {
+    pub fn is_mapped(&self, va: Va) -> bool {
         self.segment_at(va).is_some()
     }
 
     /// True if the given VA is in an executable segment.
-    pub fn is_executable(&self, va: u64) -> bool {
+    pub fn is_executable(&self, va: Va) -> bool {
         self.segment_at(va).is_some_and(|s| s.executable)
     }
 
@@ -230,8 +231,8 @@ impl LoadedBinary {
 
     /// Lowest virtual address of any mapped segment.
     /// Useful as a minimum bound for filtering out-of-range ref targets.
-    pub fn min_va(&self) -> u64 {
-        self.segments.iter().map(|s| s.va).min().unwrap_or(0)
+    pub fn min_va(&self) -> Va {
+        self.segments.iter().map(|s| s.va).min().unwrap_or(Va::ZERO)
     }
 }
 
@@ -240,13 +241,13 @@ impl LoadedBinary {
 struct ParseResult {
     arch: Arch,
     segments: Vec<Segment>,
-    entry_points: Vec<u64>,
-    symbols: Vec<(String, u64)>,
+    entry_points: Vec<Va>,
+    symbols: Vec<(String, Va)>,
     /// Non-zero only for PIE ELF binaries rebased by `parse_elf`.
     pie_base: u64,
     /// GOT slot VA → extern VA. Populated by `build_elf_got_map` for PIE ELF;
     /// empty for other formats.
-    got_map: HashMap<u64, u64>,
+    got_map: HashMap<Va, Va>,
 }
 
 /// Allocate a zero-filled buffer of `size` bytes, store it in `bufs` for
@@ -280,7 +281,7 @@ fn parse_binary(
         Object::Unknown(_) => {
             // Raw binary — treat as flat, unknown arch
             let seg = Segment {
-                va: 0,
+                va: Va::ZERO,
                 data: bytes,
                 executable: true,
                 readable: true,
@@ -292,7 +293,7 @@ fn parse_binary(
             Ok(ParseResult {
                 arch: Arch::Unknown,
                 segments: vec![seg],
-                entry_points: vec![0],
+                entry_points: vec![Va::ZERO],
                 symbols: vec![],
                 pie_base: 0,
                 got_map: HashMap::new(),
@@ -356,7 +357,7 @@ fn parse_dyld_cache(path: &Path) -> Result<DyldParseResult> {
         };
 
         segments.push(Segment {
-            va: mapping.address,
+            va: Va(mapping.address),
             data,
             executable: mapping.is_executable(),
             readable: mapping.is_readable(),
@@ -534,7 +535,7 @@ fn parse_elf(
                     }
                     let data = &bytes[sec.file_offset..sec.file_offset + sec.file_size];
                     segments.push(Segment {
-                        va: sec.va, // already rebased above
+                        va: Va(sec.va), // already rebased above
                         data,
                         // Only mark executable if the section is actual code.
                         executable: sec.is_code,
@@ -551,7 +552,7 @@ fn parse_elf(
                     let bss_sz = (ph_va_end - last_end) as usize;
                     let bss_data: &'static [u8] = alloc_bss(bss_sz, bss_bufs);
                     segments.push(Segment {
-                        va: last_end,
+                        va: Va(last_end),
                         data: bss_data,
                         executable: false,
                         readable: read,
@@ -580,7 +581,7 @@ fn parse_elf(
                     .iter()
                     .any(|s| !s.byte_scannable && s.va < ph_va_end && s.end > ph_va);
                 segments.push(Segment {
-                    va: ph_va,
+                    va: Va(ph_va),
                     data,
                     executable: exec,
                     readable: read,
@@ -603,7 +604,7 @@ fn parse_elf(
             // zero-initialized and we never write it, this is safe.
             let bss_data: &'static [u8] = alloc_bss(bss_sz, bss_bufs);
             segments.push(Segment {
-                va: bss_va,
+                va: Va(bss_va),
                 data: bss_data,
                 executable: false,
                 readable: read,
@@ -616,7 +617,7 @@ fn parse_elf(
     }
 
     let entry_points = if elf.entry != 0 {
-        vec![elf.entry + pie_base]
+        vec![Va(elf.entry + pie_base)]
     } else {
         vec![]
     };
@@ -629,7 +630,7 @@ fn parse_elf(
             if !name.is_empty() {
                 // ARM Thumb symbols have LSB set — strip it for the address.
                 // Apply pie_base after stripping the Thumb LSB.
-                let addr = (sym.st_value & !1) + pie_base;
+                let addr = Va((sym.st_value & !1) + pie_base);
                 symbols.push((name.to_string(), addr));
             }
         }
@@ -674,7 +675,7 @@ fn parse_elf(
 /// - STT_TLS symbols are excluded from the extern segment.
 /// - The GOT VA ordering used by build_got_map in prior sessions was wrong because
 ///   it ignored SHN_UNDEF symbols without GLOB_DAT/JUMP_SLOT relocs.
-fn build_elf_got_map(elf: &goblin::elf::Elf, pie_base: u64) -> HashMap<u64, u64> {
+fn build_elf_got_map(elf: &goblin::elf::Elf, pie_base: u64) -> HashMap<Va, Va> {
     use goblin::elf::program_header::PT_LOAD;
     use goblin::elf::section_header::SHN_UNDEF;
     use goblin::elf::sym::{STT_FUNC, STT_TLS};
@@ -759,8 +760,8 @@ fn build_elf_got_map(elf: &goblin::elf::Elf, pie_base: u64) -> HashMap<u64, u64>
                 return None;
             }
             let extern_va = sym_to_extern.get(&(rel.r_sym as u32))?;
-            let got_va = rel.r_offset + pie_base;
-            Some((got_va, *extern_va))
+            let got_va = Va(rel.r_offset + pie_base);
+            Some((got_va, Va(*extern_va)))
         })
         .collect()
 }
@@ -836,7 +837,7 @@ fn parse_macho(
             };
 
             segments.push(Segment {
-                va: sect.addr,
+                va: Va(sect.addr),
                 data: section_data,
                 executable: exec,
                 readable: read,
@@ -848,12 +849,12 @@ fn parse_macho(
         }
     }
 
-    let entry_points = vec![macho.entry];
+    let entry_points = vec![Va(macho.entry)];
     let mut symbols = Vec::new();
     if let Some(syms) = macho.symbols.as_ref() {
         for (name, nlist) in syms.iter().flatten() {
             if !name.is_empty() && nlist.n_value != 0 {
-                symbols.push((name.to_string(), nlist.n_value));
+                symbols.push((name.to_string(), Va(nlist.n_value)));
             }
         }
     }
@@ -898,7 +899,7 @@ fn parse_pe(
         let exec = chars & IMAGE_SCN_MEM_EXECUTE != 0;
         let read = chars & IMAGE_SCN_MEM_READ != 0;
         let write = chars & IMAGE_SCN_MEM_WRITE != 0;
-        let va = image_base + section.virtual_address as u64;
+        let va = Va(image_base + section.virtual_address as u64);
         let name = section.name().unwrap_or("?").to_string();
 
         // DWARF debug sections (goblin resolves COFF long-name offsets like "/35"
@@ -978,7 +979,7 @@ fn parse_pe(
     }
 
     let entry_points = if pe.entry != 0 {
-        vec![image_base + pe.entry as u64]
+        vec![Va(image_base + pe.entry as u64)]
     } else {
         vec![]
     };
@@ -986,7 +987,7 @@ fn parse_pe(
     let mut symbols = Vec::new();
     for export in &pe.exports {
         if let Some(name) = export.name {
-            symbols.push((name.to_string(), image_base + export.rva as u64));
+            symbols.push((name.to_string(), Va(image_base + export.rva as u64)));
         }
     }
 
@@ -1111,10 +1112,10 @@ mod tests {
     /// VA is exactly `pie_base` more than the corresponding raw-base VA.
     /// This tests the core rebasing invariant without depending on exact layout
     /// offsets that would have to be kept in sync with make_minimal_pie_elf.
-    fn segment_vas(elf: &[u8], base: Option<u64>) -> Vec<u64> {
+    fn segment_vas(elf: &[u8], base: Option<u64>) -> Vec<Va> {
         let tmp = write_tmp(elf);
         let bin = LoadedBinary::load_with_base(tmp.path(), base).unwrap();
-        let mut vas: Vec<u64> = bin.segments.iter().map(|s| s.va).collect();
+        let mut vas: Vec<Va> = bin.segments.iter().map(|s| s.va).collect();
         vas.sort_unstable();
         vas
     }
@@ -1128,7 +1129,7 @@ mod tests {
         assert_eq!(binary.pie_base, 0x0040_0000);
         // Every segment VA must be >= pie_base (they were raw-vaddr=0 or small offsets).
         assert!(
-            binary.segments.iter().all(|s| s.va >= 0x0040_0000),
+            binary.segments.iter().all(|s| s.va >= Va(0x0040_0000)),
             "all segment VAs should be rebased above 0x400000, got: {:?}",
             binary.segments.iter().map(|s| s.va).collect::<Vec<_>>()
         );
@@ -1143,7 +1144,7 @@ mod tests {
         let binary = LoadedBinary::load_with_base(tmp.path(), Some(0)).unwrap();
         assert_eq!(binary.pie_base, 0);
         // With base=0 segment VAs equal the raw (unrelocated) values.
-        let mut got: Vec<u64> = binary.segments.iter().map(|s| s.va).collect();
+        let mut got: Vec<Va> = binary.segments.iter().map(|s| s.va).collect();
         got.sort_unstable();
         assert_eq!(got, raw_vas, "base=0 should not shift VAs");
     }
@@ -1157,9 +1158,9 @@ mod tests {
         let tmp = write_tmp(&elf);
         let binary = LoadedBinary::load_with_base(tmp.path(), Some(custom_base)).unwrap();
         assert_eq!(binary.pie_base, custom_base);
-        let mut got: Vec<u64> = binary.segments.iter().map(|s| s.va).collect();
+        let mut got: Vec<Va> = binary.segments.iter().map(|s| s.va).collect();
         got.sort_unstable();
-        let expected: Vec<u64> = raw_vas.iter().map(|v| v + custom_base).collect();
+        let expected: Vec<Va> = raw_vas.iter().map(|v| *v + custom_base).collect();
         assert_eq!(
             got, expected,
             "custom base should shift all VAs by exactly custom_base"
@@ -1177,7 +1178,7 @@ mod tests {
         assert_eq!(vas_a.len(), vas_b.len(), "same number of segments");
         let delta = base_b - base_a;
         for (a, b) in vas_a.iter().zip(vas_b.iter()) {
-            assert_eq!(b - a, delta, "VA shift mismatch: {a:#x} vs {b:#x}");
+            assert_eq!(*b - *a, delta, "VA shift mismatch: {a:#x} vs {b:#x}");
         }
     }
 }

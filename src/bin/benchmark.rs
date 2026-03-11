@@ -194,7 +194,7 @@ fn run_pass(
     depth: Depth,
     workers: usize,
     runs: usize,
-    min_ref_va: u64,
+    min_ref_va: xr::Va,
 ) -> (Vec<Xref>, u64) {
     let mut best_ms = u64::MAX;
     let mut last_xrefs = Vec::new();
@@ -287,7 +287,10 @@ fn main() -> Result<()> {
     }
     println!();
 
-    let min_ref_va = cli.min_ref_va.unwrap_or_else(|| binary.min_va());
+    let min_ref_va = cli
+        .min_ref_va
+        .map(xr::Va)
+        .unwrap_or_else(|| binary.min_va());
     println!(
         "binary       : {}  arch={:?}  segments={}",
         cli.binary.display(),
@@ -326,7 +329,7 @@ fn main() -> Result<()> {
         let mut xr_all: HashSet<AddrPair> = HashSet::new();
 
         for x in &xrefs {
-            let pair = (x.from, x.to);
+            let pair = (x.from.raw(), x.to.raw());
             xr_all.insert(pair);
             let k = x.kind.name();
             if let Some(set) = xr_by_kind.get_mut(k) {
@@ -374,7 +377,7 @@ fn main() -> Result<()> {
         if depth == Depth::Paired {
             // Helper: build full xref vec filtered by kind for a given pair set
             let xref_map: std::collections::HashMap<AddrPair, &Xref> =
-                xrefs.iter().map(|x| ((x.from, x.to), x)).collect();
+                xrefs.iter().map(|x| ((x.from.raw(), x.to.raw()), x)).collect();
 
             let kind_filter = cli.dump_kind.as_deref();
 

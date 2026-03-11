@@ -4,10 +4,12 @@ pub mod loader;
 pub mod output;
 pub mod pass;
 pub(crate) mod shard;
+pub mod va;
 pub mod xref;
 
 pub use loader::{Arch, DecodeMode, LoadedBinary, Segment};
 pub use pass::{Depth, PassConfig, PassResult, XrefPass};
+pub use va::Va;
 pub use xref::{Confidence, Xref, XrefKind};
 
 /// Parse a virtual address from a string.

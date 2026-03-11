@@ -11,6 +11,7 @@
 //! This catches `mov rax, imm64; call rax` patterns.
 
 use super::{ScanRegion, SegmentDataIndex, SegmentIndex, XrefSet};
+use crate::va::Va;
 use crate::xref::{Confidence, Xref, XrefKind};
 use iced_x86::{
     Code, Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, OpAccess,
@@ -35,94 +36,31 @@ fn mem_op_is_write(
 }
 
 /// Depth 1: linear decode, immediate + RIP-relative targets.
+/// Depth 1: linear disassembly. Delegates to `scan_with_prop` — the register
+/// propagation adds negligible cost and the extra resolved xrefs are harmless
+/// (they're correct, just not required at depth 1).
 pub(crate) fn scan_linear(
     region: &ScanRegion,
     idx: &SegmentIndex,
     _data_idx: &SegmentDataIndex,
-    got_map: &HashMap<u64, u64>,
+    got_map: &HashMap<Va, Va>,
 ) -> XrefSet {
-    scan_linear_with_index(region, idx, got_map)
+    scan_with_prop(region, idx, _data_idx, got_map)
 }
 
-fn scan_linear_with_index(
-    region: &ScanRegion,
-    idx: &SegmentIndex,
-    got_map: &HashMap<u64, u64>,
-) -> XrefSet {
-    let mut xrefs = Vec::new();
-    let data = region.data;
-    let base = region.base_va;
-
-    // Only emit branch/jump xrefs when scanning executable regions.
-    // Decoding data/padding bytes as instructions produces spurious
-    // conditional-jump FPs that IDA does not record.
-    let region_is_exec = idx.is_exec(base);
-
-    let mut decoder = Decoder::with_ip(64, data, base, DecoderOptions::NONE);
-    let mut insn = Instruction::default();
-    let mut info_factory = InstructionInfoFactory::new();
-
-    while decoder.can_decode() {
-        decoder.decode_out(&mut insn);
-        if insn.is_invalid() {
-            continue;
-        }
-
-        let va = insn.ip();
-
-        // Direct calls / jumps and GOT-indirect calls — only from executable regions.
-        // Decoding data/padding bytes as instructions produces spurious FPs.
-        if region_is_exec {
-            emit_direct_branches(&insn, va, idx, got_map, &mut xrefs);
-        }
-
-        emit_rip_relative(&insn, va, idx, &mut info_factory, &mut xrefs);
-
-        // Immediate-as-pointer: IDA records data_ptr when certain instructions
-        // have an immediate operand that resolves to a mapped address.
-        //
-        // Confirmed patterns (from empirical analysis against IDA ground truth):
-        //   MOV r64, imm64          — 64-bit absolute address
-        //   MOV r/m64, imm32        — sign-extended 32-bit address (e.g. MOV RAX, 0x629080)
-        //   MOV r32, imm32          — zero-extended (low 32-bit address space)
-        //   CMP r/m64, imm32        — compare register vs in-range constant
-        //   CMP rAX, imm32          — short-form CMP against in-range constant
-        //   SUB r/m64, imm32        — subtract in-range constant
-        //   SUB rAX, imm32          — short-form SUB
-        //
-        // NOT recorded by IDA: AND, OR, XOR, TEST, PUSH, ADD with in-range immediates
-        // (these are treated as bitmasks/constants, not pointer values).
-        // Only applies within executable regions.
-        if region_is_exec {
-            if let Some(imm) = imm_as_address(&insn) {
-                if idx.contains(imm) {
-                    xrefs.push(Xref {
-                        from: va,
-                        to: imm,
-                        kind: XrefKind::DataPointer,
-                        confidence: Confidence::LinearImmediate,
-                    });
-                }
-            }
-        }
-    }
-
-    xrefs
-}
-
-/// Depth 2: depth-1 + simple register constant propagation.
+/// Depth 2: linear disassembly + simple register constant propagation.
 /// Catches `mov rax, imm64 / call rax` and similar patterns.
 pub(crate) fn scan_with_prop(
     region: &ScanRegion,
     idx: &SegmentIndex,
     _data_idx: &SegmentDataIndex,
-    got_map: &HashMap<u64, u64>,
+    got_map: &HashMap<Va, Va>,
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
-    let base = region.base_va;
+    let base = region.base_va.raw();
 
-    let region_is_exec = idx.is_exec(base);
+    let region_is_exec = idx.is_exec(region.base_va);
 
     // Track known constant values per register (GPRs 0..16 for RAX..R15)
     let mut reg_vals: [Option<u64>; 16] = [None; 16];
@@ -153,15 +91,15 @@ pub(crate) fn scan_with_prop(
                     let reg = insn.op0_register();
                     if let Some(ri) = gpr_index(reg) {
                         if let Some(known) = reg_vals[ri] {
-                            if idx.contains(known) {
+                            if idx.contains(Va(known)) {
                                 let kind = if insn.code() == Code::Call_rm64 {
                                     XrefKind::Call
                                 } else {
                                     XrefKind::Jump
                                 };
                                 xrefs.push(Xref {
-                                    from: va,
-                                    to: known,
+                                    from: Va(va),
+                                    to: Va(known),
                                     kind,
                                     confidence: Confidence::LocalProp,
                                 });
@@ -176,10 +114,10 @@ pub(crate) fn scan_with_prop(
         // Immediate-as-pointer (same criteria as in scan_linear_with_index).
         if region_is_exec {
             if let Some(imm) = imm_as_address(&insn) {
-                if idx.contains(imm) {
+                if idx.contains(Va(imm)) {
                     xrefs.push(Xref {
-                        from: va,
-                        to: imm,
+                        from: Va(va),
+                        to: Va(imm),
                         kind: XrefKind::DataPointer,
                         confidence: Confidence::LinearImmediate,
                     });
@@ -216,7 +154,7 @@ fn emit_direct_branches(
     insn: &Instruction,
     va: u64,
     idx: &SegmentIndex,
-    got_map: &HashMap<u64, u64>,
+    got_map: &HashMap<Va, Va>,
     xrefs: &mut Vec<Xref>,
 ) {
     match insn.flow_control() {
@@ -228,7 +166,7 @@ fn emit_direct_branches(
         // jump — execution either enters the transaction or jumps to the handler.
         | iced_x86::FlowControl::XbeginXabortXend => {
             if let Some(target) = direct_target(insn) {
-                if idx.contains(target) {
+                if idx.contains(Va(target)) {
                     let kind = match insn.flow_control() {
                         iced_x86::FlowControl::Call => XrefKind::Call,
                         iced_x86::FlowControl::UnconditionalBranch => XrefKind::Jump,
@@ -241,8 +179,8 @@ fn emit_direct_branches(
                         ),
                     };
                     xrefs.push(Xref {
-                        from: va,
-                        to: target,
+                        from: Va(va),
+                        to: Va(target),
                         kind,
                         confidence: Confidence::LinearImmediate,
                     });
@@ -269,7 +207,7 @@ fn emit_direct_branches(
 fn emit_got_indirect(
     insn: &Instruction,
     va: u64,
-    got_map: &HashMap<u64, u64>,
+    got_map: &HashMap<Va, Va>,
     xrefs: &mut Vec<Xref>,
 ) {
     // Only applies when the single memory operand uses RIP-relative addressing.
@@ -277,7 +215,7 @@ fn emit_got_indirect(
         && insn.op0_kind() == OpKind::Memory
         && insn.memory_base() == Register::RIP
     {
-        let got_slot_va = insn.memory_displacement64();
+        let got_slot_va = Va(insn.memory_displacement64());
         if let Some(&extern_va) = got_map.get(&got_slot_va) {
             let kind = if insn.flow_control() == FlowControl::IndirectCall {
                 XrefKind::Call
@@ -285,7 +223,7 @@ fn emit_got_indirect(
                 XrefKind::Jump
             };
             xrefs.push(Xref {
-                from: va,
+                from: Va(va),
                 to: extern_va,
                 kind,
                 confidence: Confidence::LinearImmediate,
@@ -318,8 +256,8 @@ fn emit_rip_relative(
     for op_idx in 0..insn.op_count() {
         if insn.op_kind(op_idx) == OpKind::Memory && insn.memory_base() == Register::RIP {
             let target = insn.memory_displacement64();
-            if idx.contains(target) {
-                let target_is_exec = idx.is_exec(target);
+            if idx.contains(Va(target)) {
+                let target_is_exec = idx.is_exec(Va(target));
                 let is_lea = matches!(
                     insn.code(),
                     Code::Lea_r16_m | Code::Lea_r32_m | Code::Lea_r64_m
@@ -335,8 +273,8 @@ fn emit_rip_relative(
                 // For non-LEA: suppress if target is exec (IDA doesn't record these)
                 if is_lea || !target_is_exec {
                     xrefs.push(Xref {
-                        from: va,
-                        to: target,
+                        from: Va(va),
+                        to: Va(target),
                         kind,
                         confidence: Confidence::LinearImmediate,
                     });
@@ -515,7 +453,7 @@ mod tests {
 
     fn fake_seg(va: u64, data: &'static [u8]) -> Segment {
         Segment {
-            va,
+            va: Va(va),
             data,
             executable: true,
             readable: true,
@@ -545,8 +483,8 @@ mod tests {
         let didx = SegmentDataIndex::build(&segs);
         let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
         assert_eq!(xrefs.len(), 1);
-        assert_eq!(xrefs[0].from, 0x1000);
-        assert_eq!(xrefs[0].to, 0x2000);
+        assert_eq!(xrefs[0].from, Va(0x1000));
+        assert_eq!(xrefs[0].to, Va(0x2000));
         assert_eq!(xrefs[0].kind, XrefKind::Call);
         assert_eq!(xrefs[0].confidence, Confidence::LinearImmediate);
     }
@@ -569,8 +507,8 @@ mod tests {
         let didx = SegmentDataIndex::build(&segs);
         let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
         let jmp = xrefs.iter().find(|x| x.kind == XrefKind::Jump).unwrap();
-        assert_eq!(jmp.from, 0x1005);
-        assert_eq!(jmp.to, 0x2000);
+        assert_eq!(jmp.from, Va(0x1005));
+        assert_eq!(jmp.to, Va(0x2000));
     }
 
     // ── JE rel32 (conditional) ────────────────────────────────────────────────
@@ -592,8 +530,8 @@ mod tests {
         let didx = SegmentDataIndex::build(&segs);
         let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());
         let je = xrefs.iter().find(|x| x.kind == XrefKind::CondJump).unwrap();
-        assert_eq!(je.from, 0x100a);
-        assert_eq!(je.to, 0x2000);
+        assert_eq!(je.from, Va(0x100a));
+        assert_eq!(je.to, Va(0x2000));
     }
 
     // ── LEA rax, [rip + disp32] ───────────────────────────────────────────────
@@ -616,8 +554,8 @@ mod tests {
             .iter()
             .find(|x| x.kind == XrefKind::DataPointer)
             .unwrap();
-        assert_eq!(lea.from, 0x1000);
-        assert_eq!(lea.to, 0x3000);
+        assert_eq!(lea.from, Va(0x1000));
+        assert_eq!(lea.to, Va(0x3000));
         assert_eq!(lea.confidence, Confidence::LinearImmediate);
     }
 
@@ -643,8 +581,8 @@ mod tests {
             .iter()
             .find(|x| x.confidence == Confidence::LocalProp)
             .expect("expected a LocalProp xref");
-        assert_eq!(prop.from, 0x100a);
-        assert_eq!(prop.to, 0x4000);
+        assert_eq!(prop.from, Va(0x100a));
+        assert_eq!(prop.to, Va(0x4000));
         assert_eq!(prop.kind, XrefKind::Call);
     }
 

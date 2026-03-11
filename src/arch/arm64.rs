@@ -16,6 +16,7 @@
 
 use super::{ScanRegion, SegmentDataIndex, SegmentIndex, XrefSet};
 use crate::arch::arm64_decode::Arm64Insn;
+use crate::va::Va;
 use crate::xref::{Confidence, Xref, XrefKind};
 
 // How many instructions back we look for an ADRP that feeds the current insn.
@@ -32,7 +33,7 @@ pub(crate) fn scan_linear(
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
-    let base = region.base_va;
+    let base = region.base_va.raw();
 
     // ARM64: all instructions are exactly 4 bytes, 4-byte aligned.
     // If base_va is not 4-byte aligned something is wrong with the loader.
@@ -62,7 +63,7 @@ pub(crate) fn scan_adrp(
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
-    let base = region.base_va;
+    let base = region.base_va.raw();
 
     if !base.is_multiple_of(4) {
         return xrefs;
@@ -149,13 +150,13 @@ pub(crate) fn scan_adrp(
                         if i - adrp_i <= ADRP_WINDOW {
                             let offset_val = insn.add_imm();
                             let target = page.wrapping_add(offset_val);
-                            if idx.contains(target) {
+                            if idx.contains(Va(target)) {
                                 // Emit only at ADRP VA (IDA's primary convention).
                                 // Do NOT emit at ADD VA — analysis shows this causes
                                 // massive FPs (~6981) vs minimal TP gain (~454).
                                 xrefs.push(Xref {
-                                    from: adrp_va,
-                                    to: target,
+                                    from: Va(adrp_va),
+                                    to: Va(target),
                                     kind: XrefKind::DataPointer,
                                     confidence: Confidence::PairResolved,
                                 });
@@ -198,25 +199,25 @@ pub(crate) fn scan_adrp(
                     if let Some((adrp_i, adrp_va, page, _chain)) = adrp_state[rn] {
                         if i - adrp_i <= ADRP_WINDOW {
                             let got_addr = page.wrapping_add(insn.ldr_str_offset());
-                            let got_is_exec = idx.is_exec(got_addr);
+                            let got_is_exec = idx.is_exec(Va(got_addr));
 
                             // ADRP → data_ptr to GOT address (matching IDA's data_ptr at ADRP)
-                            if idx.contains(got_addr) {
+                            if idx.contains(Va(got_addr)) {
                                 xrefs.push(Xref {
-                                    from: adrp_va,
-                                    to: got_addr,
+                                    from: Va(adrp_va),
+                                    to: Va(got_addr),
                                     kind: XrefKind::DataPointer,
                                     confidence: Confidence::PairResolved,
                                 });
                             }
 
-                            if idx.contains(got_addr) {
+                            if idx.contains(Va(got_addr)) {
                                 // data_read at LDR_va → resolved address (IDA dr_R).
                                 // IDA records this even for exec-segment targets (e.g. jump tables,
                                 // zero-init data regions embedded in .text), so no exec suppression.
                                 xrefs.push(Xref {
-                                    from: va,
-                                    to: got_addr,
+                                    from: Va(va),
+                                    to: Va(got_addr),
                                     kind: XrefKind::DataRead,
                                     confidence: Confidence::PairResolved,
                                 });
@@ -227,8 +228,8 @@ pub(crate) fn scan_adrp(
                             // Uses SegmentDataIndex for O(log n) lookup instead of a linear scan.
                             let stored_val: Option<u64> = if !got_is_exec {
                                 data_idx
-                                    .read_u64_at_nonexec(got_addr)
-                                    .filter(|&v| v != 0 && idx.contains(v))
+                                    .read_u64_at_nonexec(Va(got_addr))
+                                    .filter(|&v| v != 0 && idx.contains(Va(v)))
                             } else {
                                 None
                             };
@@ -236,8 +237,8 @@ pub(crate) fn scan_adrp(
                             // Pointer-follow: emit data_ptr at LDR_va → loaded function/data pointer.
                             if let Some(v) = stored_val {
                                 xrefs.push(Xref {
-                                    from: va,
-                                    to: v,
+                                    from: Va(va),
+                                    to: Va(v),
                                     kind: XrefKind::DataPointer,
                                     confidence: Confidence::PairResolved,
                                 });
@@ -273,13 +274,13 @@ pub(crate) fn scan_adrp(
                             // Suppress writes to exec or read-only segments: IDA doesn't record
                             // data_write to .text or .rodata. Only writable data segments matter.
                             // A segment is writable iff FLAG_WRITE is set and FLAG_EXEC is clear.
-                            let is_writable_data = idx.flags_at(addr).is_some_and(|f| {
+                            let is_writable_data = idx.flags_at(Va(addr)).is_some_and(|f| {
                                 f & super::FLAG_WRITE != 0 && f & super::FLAG_EXEC == 0
                             });
                             if is_writable_data {
                                 xrefs.push(Xref {
-                                    from: va,
-                                    to: addr,
+                                    from: Va(va),
+                                    to: Va(addr),
                                     kind: XrefKind::DataWrite,
                                     confidence: Confidence::PairResolved,
                                 });
@@ -301,10 +302,10 @@ pub(crate) fn scan_adrp(
                 let rn = insn.rn() as usize;
                 if rn < 31 {
                     if let Some((adrp_i, _adrp_va, target, is_chain)) = adrp_state[rn] {
-                        if !is_chain && i - adrp_i <= ADRP_WINDOW && idx.is_exec(target) {
+                        if !is_chain && i - adrp_i <= ADRP_WINDOW && idx.is_exec(Va(target)) {
                             xrefs.push(Xref {
-                                from: va,
-                                to: target,
+                                from: Va(va),
+                                to: Va(target),
                                 kind: XrefKind::Call,
                                 confidence: Confidence::PairResolved,
                             });
@@ -320,10 +321,10 @@ pub(crate) fn scan_adrp(
                 let rn = insn.rn() as usize;
                 if rn < 31 {
                     if let Some((adrp_i, _adrp_va, target, is_chain)) = adrp_state[rn] {
-                        if !is_chain && i - adrp_i <= ADRP_WINDOW && idx.is_exec(target) {
+                        if !is_chain && i - adrp_i <= ADRP_WINDOW && idx.is_exec(Va(target)) {
                             xrefs.push(Xref {
-                                from: va,
-                                to: target,
+                                from: Va(va),
+                                to: Va(target),
                                 kind: XrefKind::Jump,
                                 confidence: Confidence::PairResolved,
                             });
@@ -366,10 +367,10 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
             let target = insn.imm26_target(va);
             // IDA records calls only to executable addresses. Suppress BL to non-exec
             // (e.g. BL to .rodata in dead code regions — IDA never records these).
-            if idx.contains(target) && idx.is_exec(target) {
+            if idx.contains(Va(target)) && idx.is_exec(Va(target)) {
                 Some(Xref {
-                    from: va,
-                    to: target,
+                    from: Va(va),
+                    to: Va(target),
                     kind: XrefKind::Call,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -379,10 +380,10 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
         }
         Arm64Insn::B(_) => {
             let target = insn.imm26_target(va);
-            if idx.contains(target) {
+            if idx.contains(Va(target)) {
                 Some(Xref {
-                    from: va,
-                    to: target,
+                    from: Va(va),
+                    to: Va(target),
                     kind: XrefKind::Jump,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -392,10 +393,10 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
         }
         Arm64Insn::BCond(_) => {
             let target = insn.imm19_target(va);
-            if idx.contains(target) {
+            if idx.contains(Va(target)) {
                 Some(Xref {
-                    from: va,
-                    to: target,
+                    from: Va(va),
+                    to: Va(target),
                     kind: XrefKind::CondJump,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -406,10 +407,10 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
         Arm64Insn::Cbz(_) | Arm64Insn::Cbnz(_) => {
             // CBZ/CBNZ Xn, #label — label is second operand
             let target = insn.cbz_target(va);
-            if idx.contains(target) {
+            if idx.contains(Va(target)) {
                 Some(Xref {
-                    from: va,
-                    to: target,
+                    from: Va(va),
+                    to: Va(target),
                     kind: XrefKind::CondJump,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -420,10 +421,10 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
         Arm64Insn::Tbz(_) | Arm64Insn::Tbnz(_) => {
             // TBZ/TBNZ Xn, #bit, #label — label is third operand
             let target = insn.imm14_target(va);
-            if idx.contains(target) {
+            if idx.contains(Va(target)) {
                 Some(Xref {
-                    from: va,
-                    to: target,
+                    from: Va(va),
+                    to: Va(target),
                     kind: XrefKind::CondJump,
                     confidence: Confidence::LinearImmediate,
                 })
@@ -457,7 +458,7 @@ mod tests {
     /// Build a fake executable segment covering exactly the given bytes at `base_va`.
     fn fake_seg(base_va: u64, data: &'static [u8]) -> Segment {
         Segment {
-            va: base_va,
+            va: Va(base_va),
             data,
             executable: true,
             readable: true,
@@ -492,8 +493,8 @@ mod tests {
         let xrefs = scan_linear(&region, &idx, &didx);
 
         assert_eq!(xrefs.len(), 1);
-        assert_eq!(xrefs[0].from, 0x1000);
-        assert_eq!(xrefs[0].to, 0x1010);
+        assert_eq!(xrefs[0].from, Va(0x1000));
+        assert_eq!(xrefs[0].to, Va(0x1010));
         assert_eq!(xrefs[0].kind, XrefKind::Call);
         assert_eq!(xrefs[0].confidence, Confidence::LinearImmediate);
     }
@@ -514,8 +515,8 @@ mod tests {
         let didx = SegmentDataIndex::build(&segs);
         let xrefs = scan_linear(&region_for(&code_seg), &idx, &didx);
         assert_eq!(xrefs.len(), 1);
-        assert_eq!(xrefs[0].from, 0x1008);
-        assert_eq!(xrefs[0].to, 0x1010);
+        assert_eq!(xrefs[0].from, Va(0x1008));
+        assert_eq!(xrefs[0].to, Va(0x1010));
         assert_eq!(xrefs[0].kind, XrefKind::Jump);
     }
 
@@ -536,8 +537,8 @@ mod tests {
         let didx = SegmentDataIndex::build(&segs);
         let xrefs = scan_linear(&region_for(&seg), &idx, &didx);
         // CBZ at 0x1008 → target 0x1004
-        let cbz_xref = xrefs.iter().find(|x| x.from == 0x1008).unwrap();
-        assert_eq!(cbz_xref.to, 0x1004);
+        let cbz_xref = xrefs.iter().find(|x| x.from == Va(0x1008)).unwrap();
+        assert_eq!(cbz_xref.to, Va(0x1004));
         assert_eq!(cbz_xref.kind, XrefKind::CondJump);
     }
 
@@ -564,8 +565,8 @@ mod tests {
             .iter()
             .find(|x| x.confidence == Confidence::PairResolved)
             .expect("expected a PairResolved xref");
-        assert_eq!(pair.from, 0x1000); // ADRP va (IDA records at ADRP, not ADD)
-        assert_eq!(pair.to, 0x2100); // 0x2000 + 0x100
+        assert_eq!(pair.from, Va(0x1000)); // ADRP va (IDA records at ADRP, not ADD)
+        assert_eq!(pair.to, Va(0x2100)); // 0x2000 + 0x100
         assert_eq!(pair.kind, XrefKind::DataPointer);
     }
 

@@ -113,18 +113,21 @@ fn main() -> Result<()> {
         binary.entry_points.len()
     );
 
-    let min_ref_va = cli.min_ref_va.unwrap_or_else(|| binary.min_va());
+    let min_ref_va = cli
+        .min_ref_va
+        .map(xr::Va)
+        .unwrap_or_else(|| binary.min_va());
 
     let from_range = match (cli.start, cli.end) {
-        (Some(lo), Some(hi)) => Some((lo, hi)),
-        (Some(lo), None) => Some((lo, u64::MAX)),
-        (None, Some(hi)) => Some((0, hi)),
+        (Some(lo), Some(hi)) => Some((xr::Va(lo), xr::Va(hi))),
+        (Some(lo), None) => Some((xr::Va(lo), xr::Va(u64::MAX))),
+        (None, Some(hi)) => Some((xr::Va(0), xr::Va(hi))),
         (None, None) => None,
     };
     let to_range = match (cli.ref_start, cli.ref_end) {
-        (Some(lo), Some(hi)) => Some((lo, hi)),
-        (Some(lo), None) => Some((lo, u64::MAX)),
-        (None, Some(hi)) => Some((0, hi)),
+        (Some(lo), Some(hi)) => Some((xr::Va(lo), xr::Va(hi))),
+        (Some(lo), None) => Some((xr::Va(lo), xr::Va(u64::MAX))),
+        (None, Some(hi)) => Some((xr::Va(0), xr::Va(hi))),
         (None, None) => None,
     };
 
@@ -204,7 +207,7 @@ fn main() -> Result<()> {
                                 .map(|seg| {
                                     let off = (x.from - seg.va) as usize;
                                     let len = 8.min(seg.data.len().saturating_sub(off));
-                                    vec![ContextLine::data(x.from, &seg.data[off..off + len])]
+                                    vec![ContextLine::data(x.from.raw(), &seg.data[off..off + len])]
                                 })
                                 .unwrap_or_default()
                         } else {
@@ -214,8 +217,8 @@ fn main() -> Result<()> {
                         None
                     };
                     let record = XrefRecord {
-                        from: x.from,
-                        to: x.to,
+                        from: x.from.raw(),
+                        to: x.to.raw(),
                         kind: x.kind,
                         confidence: x.confidence,
                         context,

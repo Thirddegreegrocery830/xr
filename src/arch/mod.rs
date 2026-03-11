@@ -3,13 +3,14 @@ pub mod arm64_decode;
 pub(crate) mod x86_64;
 
 use crate::loader::{DecodeMode, Segment};
+use crate::va::Va;
 use crate::xref::{Confidence, Xref, XrefKind};
 
 /// Everything a single-pass xref extractor needs to know about
 /// the region it's scanning.
 pub(crate) struct ScanRegion<'a> {
     pub data: &'a [u8],
-    pub base_va: u64,
+    pub base_va: Va,
     /// Decode mode for this region (Default, Thumb, Arm32).
     /// Reserved for arm32/Thumb scanners — not used by arm64/x86-64.
     #[allow(dead_code)]
@@ -21,7 +22,7 @@ pub(crate) struct ScanRegion<'a> {
 }
 
 impl<'a> ScanRegion<'a> {
-    pub fn new(seg: &'a Segment, start_va: u64, end_va: u64) -> Self {
+    pub fn new(seg: &'a Segment, start_va: Va, end_va: Va) -> Self {
         let offset = (start_va - seg.va) as usize;
         let len = ((end_va - start_va) as usize).min(seg.data.len() - offset);
         Self {
@@ -48,7 +49,7 @@ pub(crate) type XrefSet = Vec<Xref>;
 ///   bit 1 — writable
 pub(crate) struct SegmentIndex {
     /// Sorted by `start`.
-    entries: Vec<(u64, u64, u8)>,
+    entries: Vec<(Va, Va, u8)>,
 }
 
 pub(crate) const FLAG_EXEC: u8 = 0b01;
@@ -56,7 +57,7 @@ pub(crate) const FLAG_WRITE: u8 = 0b10;
 
 impl SegmentIndex {
     pub(crate) fn build(segments: &[Segment]) -> Self {
-        let mut entries: Vec<(u64, u64, u8)> = segments
+        let mut entries: Vec<(Va, Va, u8)> = segments
             .iter()
             .map(|s| {
                 let mut flags = 0u8;
@@ -75,25 +76,25 @@ impl SegmentIndex {
 
     /// True if `va` falls within any mapped segment.
     #[inline]
-    pub(crate) fn contains(&self, va: u64) -> bool {
+    pub(crate) fn contains(&self, va: Va) -> bool {
         self.entry_at(va).is_some()
     }
 
     /// True if `va` falls within an executable segment.
     #[inline]
-    pub(crate) fn is_exec(&self, va: u64) -> bool {
+    pub(crate) fn is_exec(&self, va: Va) -> bool {
         self.entry_at(va).is_some_and(|f| f & FLAG_EXEC != 0)
     }
 
     /// Returns the flags byte for the segment covering `va`, or None if unmapped.
     #[inline]
-    pub(crate) fn flags_at(&self, va: u64) -> Option<u8> {
+    pub(crate) fn flags_at(&self, va: Va) -> Option<u8> {
         self.entry_at(va)
     }
 
     /// Binary-search for the entry covering `va`. Returns the flags byte.
     #[inline]
-    fn entry_at(&self, va: u64) -> Option<u8> {
+    fn entry_at(&self, va: Va) -> Option<u8> {
         // Find the last entry whose start <= va.
         let idx = self.entries.partition_point(|e| e.0 <= va);
         if idx == 0 {
@@ -127,7 +128,7 @@ impl SegmentIndex {
 /// same `XrefPass::run()` call that borrows it.
 pub(crate) struct SegmentDataIndex {
     /// Sorted by `start`.
-    entries: Vec<(u64, u64, u8, *const u8, usize)>,
+    entries: Vec<(Va, Va, u8, *const u8, usize)>,
 }
 
 // Safety: the raw pointers inside point into mmaps / Box<[u8]> that are
@@ -137,7 +138,7 @@ unsafe impl Sync for SegmentDataIndex {}
 
 impl SegmentDataIndex {
     pub(crate) fn build(segments: &[crate::loader::Segment]) -> Self {
-        let mut entries: Vec<(u64, u64, u8, *const u8, usize)> = segments
+        let mut entries: Vec<(Va, Va, u8, *const u8, usize)> = segments
             .iter()
             .map(|s| {
                 let mut flags = 0u8;
@@ -163,7 +164,7 @@ impl SegmentDataIndex {
     /// Binary-search for the entry covering `va`.
     /// Returns `(flags, data_ptr, data_len, start_va)` or `None` if unmapped.
     #[inline]
-    fn entry_at(&self, va: u64) -> Option<(u8, *const u8, usize, u64)> {
+    fn entry_at(&self, va: Va) -> Option<(u8, *const u8, usize, Va)> {
         let idx = self.entries.partition_point(|e| e.0 <= va);
         if idx == 0 {
             return None;
@@ -180,7 +181,7 @@ impl SegmentDataIndex {
     /// Returns `None` if `va` is unmapped, executable, or the read would
     /// overflow the segment.
     #[inline]
-    pub(crate) fn read_u64_at_nonexec(&self, va: u64) -> Option<u64> {
+    pub(crate) fn read_u64_at_nonexec(&self, va: Va) -> Option<u64> {
         let (flags, ptr, len, start) = self.entry_at(va)?;
         if flags & FLAG_EXEC != 0 {
             return None;
@@ -197,7 +198,7 @@ impl SegmentDataIndex {
 
     /// Returns the flags byte for the segment covering `va`, or `None` if unmapped.
     #[inline]
-    pub(crate) fn flags_at(&self, va: u64) -> Option<u8> {
+    pub(crate) fn flags_at(&self, va: Va) -> Option<u8> {
         self.entry_at(va).map(|(f, _, _, _)| f)
     }
 }
@@ -237,7 +238,8 @@ pub(crate) fn byte_scan_pointers(
         };
 
         if target != 0 {
-            let emit = match data_idx.flags_at(target) {
+            let target_va = Va(target);
+            let emit = match data_idx.flags_at(target_va) {
                 // Target in a non-exec segment: always emit.
                 Some(f) if f & FLAG_EXEC == 0 => true,
                 // Target in an exec segment: vtables and function pointer tables
@@ -254,7 +256,7 @@ pub(crate) fn byte_scan_pointers(
                 let from = region.base_va + i as u64;
                 xrefs.push(Xref {
                     from,
-                    to: target,
+                    to: target_va,
                     kind: XrefKind::DataPointer,
                     confidence: Confidence::ByteScan,
                 });

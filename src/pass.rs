@@ -2,6 +2,7 @@ use crate::arch::arm64;
 use crate::arch::x86_64;
 use crate::arch::{self, ScanRegion, SegmentDataIndex, SegmentIndex};
 use crate::loader::{Arch, DecodeMode, LoadedBinary, Segment};
+use crate::va::Va;
 use crate::shard::split_range;
 use crate::xref::Xref;
 use rayon::prelude::*;
@@ -40,16 +41,16 @@ pub struct PassConfig {
     /// Note: for non-PIE binaries `min_va()` returns the lowest segment VA
     /// (which may be 0x0 for firmware or flat images), causing this filter to
     /// become a no-op — no xrefs are incorrectly dropped in that case.
-    pub min_ref_va: u64,
+    pub min_ref_va: Va,
     /// Restrict scanning to xrefs whose `from` address falls in `[start, end)`.
     /// Applied at shard-generation time — segments outside the range are skipped
     /// entirely, so no decode work is wasted.
     /// `None` = no restriction (scan everything).
-    pub from_range: Option<(u64, u64)>,
+    pub from_range: Option<(Va, Va)>,
     /// Retain only xrefs whose `to` address falls in `[start, end)`.
     /// Applied as a post-filter after scanning.
     /// `None` = no restriction.
-    pub to_range: Option<(u64, u64)>,
+    pub to_range: Option<(Va, Va)>,
 }
 
 impl Default for PassConfig {
@@ -58,7 +59,7 @@ impl Default for PassConfig {
             depth: Depth::Paired,
             workers: 0,
             boundary_overlap: 64, // 16 ARM64 instructions of lookahead
-            min_ref_va: 0,
+            min_ref_va: Va::ZERO,
             from_range: None,
             to_range: None,
         }
@@ -190,7 +191,7 @@ impl<'a> XrefPass<'a> {
         // owned_end = next shard's start (or seg_end for the last shard).
         // scan_end includes the overlap lookahead; owned_end does not.
         // Using next shard's start directly handles overlap >= chunk correctly.
-        let code_shards: Vec<(&Segment, u64, u64, u64)> = if depth == Depth::ByteScan {
+        let code_shards: Vec<(&Segment, Va, Va, Va)> = if depth == Depth::ByteScan {
             // ByteScan is data-only — no instruction decoding.
             vec![]
         } else {
@@ -208,22 +209,22 @@ impl<'a> XrefPass<'a> {
                 if scan_start >= scan_end {
                     return vec![];
                 }
-                let shards = split_range(scan_start, scan_end, n_workers, overlap, insn_align);
+                let shards = split_range(scan_start.raw(), scan_end.raw(), n_workers, overlap, insn_align);
                 let n = shards.len();
-                let starts: Vec<u64> = shards.iter().map(|(s, _)| *s).collect();
+                let starts: Vec<Va> = shards.iter().map(|(s, _)| Va(*s)).collect();
                 shards
                     .into_iter()
                     .enumerate()
                     .map(move |(i, (start, end))| {
                         let owned_end = if i + 1 < n { starts[i + 1] } else { scan_end };
-                        (seg, start, end, owned_end)
+                        (seg, Va(start), Va(end), owned_end)
                     })
                     .collect()
             })
             .collect()
         };
 
-        let data_shards: Vec<(&Segment, u64, u64)> = if depth >= Depth::ByteScan {
+        let data_shards: Vec<(&Segment, Va, Va)> = if depth >= Depth::ByteScan {
             self.binary
                 .scannable_data_segments()
                 .flat_map(|seg| {
@@ -237,8 +238,8 @@ impl<'a> XrefPass<'a> {
                         return vec![];
                     }
                     let shards = split_range(
-                        scan_start,
-                        scan_end,
+                        scan_start.raw(),
+                        scan_end.raw(),
                         n_workers,
                         0,
                         // Align shard boundaries to pointer size so that
@@ -251,7 +252,7 @@ impl<'a> XrefPass<'a> {
                     );
                     shards
                         .into_iter()
-                        .map(move |(start, end)| (seg, start, end))
+                        .map(move |(start, end)| (seg, Va(start), Va(end)))
                         .collect()
                 })
                 .collect()
@@ -337,7 +338,7 @@ impl<'a> XrefPass<'a> {
                         let mut batch = scan_shard(seg, start, end, arch, depth, &ctx);
                         batch.retain(|x| {
                             x.from < owned_end
-                                && (min_ref_va == 0 || x.to >= min_ref_va)
+                                && (min_ref_va == Va::ZERO || x.to >= min_ref_va)
                                 && to_range.is_none_or(|(lo, hi)| x.to >= lo && x.to < hi)
                         });
                         if !batch.is_empty() {
@@ -356,7 +357,7 @@ impl<'a> XrefPass<'a> {
                         let region = ScanRegion::new(seg, start, end);
                         let mut batch = arch::byte_scan_pointers(&region, ctx.data_idx, ptr_size);
                         batch.retain(|x| {
-                            (min_ref_va == 0 || x.to >= min_ref_va)
+                            (min_ref_va == Va::ZERO || x.to >= min_ref_va)
                                 && to_range.is_none_or(|(lo, hi)| x.to >= lo && x.to < hi)
                         });
                         if !batch.is_empty() {
@@ -397,13 +398,13 @@ struct ScanCtx<'a> {
     seg_idx: &'a SegmentIndex,
     data_idx: &'a SegmentDataIndex,
     /// GOT slot VA → extern VA (from `LoadedBinary::got_map`).
-    got_map: &'a std::collections::HashMap<u64, u64>,
+    got_map: &'a std::collections::HashMap<Va, Va>,
 }
 
 fn scan_shard(
     seg: &Segment,
-    start_va: u64,
-    end_va: u64,
+    start_va: Va,
+    end_va: Va,
     arch: Arch,
     depth: Depth,
     ctx: &ScanCtx<'_>,
@@ -476,7 +477,7 @@ mod tests {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let data: &'static [u8] = Box::leak(bytes.into_boxed_slice());
         Segment {
-            va,
+            va: Va(va),
             data,
             executable: true,
             readable: true,
@@ -492,7 +493,7 @@ mod tests {
         let bytes: Vec<u8> = pointers.iter().flat_map(|p| p.to_le_bytes()).collect();
         let data: &'static [u8] = Box::leak(bytes.into_boxed_slice());
         Segment {
-            va,
+            va: Va(va),
             data,
             executable: false,
             readable: true,
@@ -528,7 +529,7 @@ mod tests {
 
     /// Assert no duplicate (from, to, kind) triples exist in the xref list.
     fn assert_no_duplicates(xrefs: &[Xref]) {
-        let mut seen: AHashSet<(u64, u64, u8)> = AHashSet::new();
+        let mut seen: AHashSet<(Va, Va, u8)> = AHashSet::new();
         for x in xrefs {
             let key = (x.from, x.to, x.kind as u8);
             assert!(
@@ -643,7 +644,7 @@ mod tests {
             "expected exactly 1 xref at boundary, got {}",
             xrefs.len()
         );
-        assert_eq!(xrefs[0].from, shard_boundary);
+        assert_eq!(xrefs[0].from, Va(shard_boundary));
     }
 
     /// Adversarial: xref at `owned_end - 4` (last owned instruction).
@@ -687,7 +688,7 @@ mod tests {
 
         assert_no_duplicates(&xrefs);
         assert_eq!(xrefs.len(), 1, "last owned instruction must be emitted");
-        assert_eq!(xrefs[0].from, last_owned);
+        assert_eq!(xrefs[0].from, Va(last_owned));
     }
 
     /// Single-shard segment: segment smaller than the overlap window.
@@ -823,7 +824,7 @@ mod tests {
                 1,
                 "workers={workers}: segment-start xref missing"
             );
-            assert_eq!(xrefs[0].from, base_va);
+            assert_eq!(xrefs[0].from, Va(base_va));
         }
     }
 
@@ -873,7 +874,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((base_va, seg_end)),
+                from_range: Some((Va(base_va), Va(seg_end))),
                 ..Default::default()
             },
         )
@@ -904,7 +905,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((base_va, midpoint)),
+                from_range: Some((Va(base_va), Va(midpoint))),
                 ..Default::default()
             },
         )
@@ -914,7 +915,7 @@ mod tests {
         });
         assert_eq!(xrefs.len(), n / 2, "first-half from_range");
         assert!(
-            xrefs.iter().all(|x| x.from < midpoint),
+            xrefs.iter().all(|x| x.from < Va(midpoint)),
             "all froms below midpoint"
         );
     }
@@ -940,7 +941,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((midpoint, seg_end)),
+                from_range: Some((Va(midpoint), Va(seg_end))),
                 ..Default::default()
             },
         )
@@ -950,7 +951,7 @@ mod tests {
         });
         assert_eq!(xrefs.len(), n / 2, "second-half from_range");
         assert!(
-            xrefs.iter().all(|x| x.from >= midpoint),
+            xrefs.iter().all(|x| x.from >= Va(midpoint)),
             "all froms at or above midpoint"
         );
     }
@@ -974,7 +975,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((0xffff_0000, 0xffff_1000)), // nowhere near base_va
+                from_range: Some((Va(0xffff_0000), Va(0xffff_1000))), // nowhere near base_va
                 ..Default::default()
             },
         )
@@ -1011,7 +1012,7 @@ mod tests {
                 PassConfig {
                     depth: Depth::Linear,
                     workers,
-                    from_range: Some((q1, q3)),
+                    from_range: Some((Va(q1), Va(q3))),
                     ..Default::default()
                 },
             )
@@ -1025,7 +1026,7 @@ mod tests {
                 n / 2,
                 "workers={workers}: middle-half from_range"
             );
-            assert!(xrefs.iter().all(|x| x.from >= q1 && x.from < q3));
+            assert!(xrefs.iter().all(|x| x.from >= Va(q1) && x.from < Va(q3)));
         }
     }
 
@@ -1050,7 +1051,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                to_range: Some((target_va, target_va + 4)),
+                to_range: Some((Va(target_va), Va(target_va + 4))),
                 ..Default::default()
             },
         )
@@ -1084,7 +1085,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                to_range: Some((0x1000_0000, 0x2000_0000)), // far from target_va
+                to_range: Some((Va(0x1000_0000), Va(0x2000_0000))), // far from target_va
                 ..Default::default()
             },
         )
@@ -1128,8 +1129,8 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((base_a, base_a + n as u64 * 4)),
-                to_range: Some((target_a, target_a + 4)),
+                from_range: Some((Va(base_a), Va(base_a + n as u64 * 4))),
+                to_range: Some((Va(target_a), Va(target_a + 4))),
                 ..Default::default()
             },
         )
@@ -1140,8 +1141,8 @@ mod tests {
         assert_eq!(xrefs.len(), n, "combined filter: only seg_a→target_a xrefs");
         assert!(xrefs
             .iter()
-            .all(|x| x.from >= base_a && x.from < base_a + n as u64 * 4));
-        assert!(xrefs.iter().all(|x| x.to == target_a));
+            .all(|x| x.from >= Va(base_a) && x.from < Va(base_a + n as u64 * 4)));
+        assert!(xrefs.iter().all(|x| x.to == Va(target_a)));
     }
 
     /// Multiple segments: uniqueness must hold across all segments combined.

@@ -5,6 +5,7 @@
 //! `grep -A / -B` for source code.
 
 use crate::loader::{Arch, DecodeMode, Segment};
+use crate::va::Va;
 
 /// A single disassembled instruction line.
 #[derive(Debug)]
@@ -28,7 +29,7 @@ pub struct DisasmLine {
 pub fn context(
     arch: Arch,
     segments: &[Segment],
-    focus_va: u64,
+    focus_va: Va,
     before: usize,
     after: usize,
 ) -> Vec<DisasmLine> {
@@ -43,9 +44,10 @@ pub fn context(
         return vec![];
     }
 
+    let focus_raw = focus_va.raw();
     match arch {
-        Arch::X86_64 | Arch::X86 => disasm_x86(seg, focus_va, before, after),
-        Arch::Arm64 => disasm_arm64(seg, focus_va, before, after),
+        Arch::X86_64 | Arch::X86 => disasm_x86(seg, focus_raw, before, after),
+        Arch::Arm64 => disasm_arm64(seg, focus_raw, before, after),
         _ => vec![],
     }
 }
@@ -77,7 +79,7 @@ fn disasm_x86(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<
         fmt
     };
 
-    let seg_offset = (focus_va - seg.va) as usize;
+    let seg_offset = (focus_va - seg.va.raw()) as usize;
 
     // ── Step 1: anchor-decode focus + after context from focus_va ────────────
     let anchor_end_off = (seg_offset + (after + 2) * 15).min(seg.data.len());
@@ -145,7 +147,7 @@ fn disasm_x86(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<
             // Decode exactly one instruction from probe_off.
             let end_off = (probe_off + MAX_X86_INSN).min(seg.data.len());
             let slice = &seg.data[probe_off..end_off];
-            let mut dec = Decoder::with_ip(bitness, slice, probe_va, DecoderOptions::NONE);
+            let mut dec = Decoder::with_ip(bitness, slice, probe_va.raw(), DecoderOptions::NONE);
             if !dec.can_decode() {
                 continue;
             }
@@ -165,13 +167,13 @@ fn disasm_x86(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<
                 let probe_va = seg.va + probe_off as u64;
                 let end_off = (probe_off + MAX_X86_INSN).min(seg.data.len());
                 let slice = &seg.data[probe_off..end_off];
-                let mut dec = Decoder::with_ip(bitness, slice, probe_va, DecoderOptions::NONE);
+                let mut dec = Decoder::with_ip(bitness, slice, probe_va.raw(), DecoderOptions::NONE);
                 let mut fmt = make_fmt();
                 let insn = dec.decode();
                 let raw = slice[..insn.len()].to_vec();
                 let mut buf = Buf(String::new());
                 fmt.format(&insn, &mut buf);
-                before_context.push((probe_va, raw, buf.0));
+                before_context.push((probe_va.raw(), raw, buf.0));
                 cursor_off = probe_off;
             }
         }
@@ -215,7 +217,7 @@ fn disasm_x86(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<
 
 fn disasm_arm64(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<DisasmLine> {
     // AArch64 has fixed 4-byte instructions — no alignment ambiguity.
-    let seg_offset = (focus_va - seg.va) as usize;
+    let seg_offset = (focus_va - seg.va.raw()) as usize;
 
     // Align start to 4-byte boundary.
     let scan_back_bytes = before * 4;
@@ -228,7 +230,7 @@ fn disasm_arm64(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Ve
 
     let mut all: Vec<(u64, Vec<u8>, String)> = Vec::new();
     for (i, chunk) in data.chunks_exact(4).enumerate() {
-        let va = scan_start_va + (i * 4) as u64;
+        let va = (scan_start_va + (i * 4) as u64).raw();
         let word = u32::from_le_bytes(chunk.try_into().unwrap());
         let text = match bad64::decode(word, va) {
             Ok(insn) => insn.to_string(),
@@ -249,7 +251,7 @@ mod tests {
 
     fn exec_seg(va: u64, data: &'static [u8]) -> Segment {
         Segment {
-            va,
+            va: crate::va::Va(va),
             data,
             executable: true,
             readable: true,
