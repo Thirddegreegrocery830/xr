@@ -30,7 +30,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::Instant;
 use xr::pass::PassConfig;
-use xr::xref::Xref;
+use xr::xref::{Xref, XrefKind};
 use xr::{Depth, LoadedBinary, XrefPass};
 
 #[derive(Parser)]
@@ -256,19 +256,19 @@ fn main() -> Result<()> {
     };
 
     // Build IDA sets per kind and overall
-    let mut ida_by_kind: HashMap<&str, HashSet<AddrPair>> = HashMap::new();
+    let mut ida_by_kind: HashMap<XrefKind, HashSet<AddrPair>> = HashMap::new();
     let mut ida_all: HashSet<AddrPair> = HashSet::new();
-    // IDA kinds we care about: call, jump, data_read, data_write, data_ptr
-    const KINDS: &[&str] = &["call", "jump", "data_read", "data_write", "data_ptr"];
-    for k in KINDS {
+    for &k in XrefKind::SCORED_KINDS {
         ida_by_kind.insert(k, HashSet::new());
     }
 
     for x in ida_raw {
         let pair = (x.from.wrapping_add(va_offset), x.to.wrapping_add(va_offset));
         ida_all.insert(pair);
-        if let Some(set) = ida_by_kind.get_mut(x.kind.as_str()) {
-            set.insert(pair);
+        if let Some(kind) = XrefKind::from_name(&x.kind) {
+            if let Some(set) = ida_by_kind.get_mut(&kind) {
+                set.insert(pair);
+            }
         }
     }
 
@@ -282,8 +282,8 @@ fn main() -> Result<()> {
         ida_raw.len(),
         cli.ground_truth.display()
     );
-    for k in KINDS {
-        println!("  {k:<12} {}", ida_by_kind[k].len());
+    for &k in XrefKind::SCORED_KINDS {
+        println!("  {:<12} {}", k.name(), ida_by_kind[&k].len());
     }
     println!();
 
@@ -322,8 +322,8 @@ fn main() -> Result<()> {
         let (xrefs, ms) = run_pass(&binary, depth, cli.workers, cli.runs, min_ref_va);
 
         // Build xr sets per kind and overall
-        let mut xr_by_kind: HashMap<&str, HashSet<AddrPair>> = HashMap::new();
-        for k in KINDS {
+        let mut xr_by_kind: HashMap<XrefKind, HashSet<AddrPair>> = HashMap::new();
+        for &k in XrefKind::SCORED_KINDS {
             xr_by_kind.insert(k, HashSet::new());
         }
         let mut xr_all: HashSet<AddrPair> = HashSet::new();
@@ -331,8 +331,8 @@ fn main() -> Result<()> {
         for x in &xrefs {
             let pair = (x.from.raw(), x.to.raw());
             xr_all.insert(pair);
-            let k = x.kind.name();
-            if let Some(set) = xr_by_kind.get_mut(k) {
+            let k = x.kind.scored_kind();
+            if let Some(set) = xr_by_kind.get_mut(&k) {
                 set.insert(pair);
             }
         }
@@ -347,11 +347,11 @@ fn main() -> Result<()> {
         print_stats("overall", &s, xr_all.len(), ida_all.len());
 
         // Per kind
-        for k in KINDS {
-            let xr_k = &xr_by_kind[k];
-            let ida_k = &ida_by_kind[k];
+        for &k in XrefKind::SCORED_KINDS {
+            let xr_k = &xr_by_kind[&k];
+            let ida_k = &ida_by_kind[&k];
             let s = compute_stats(xr_k, ida_k);
-            print_stats(k, &s, xr_k.len(), ida_k.len());
+            print_stats(k.name(), &s, xr_k.len(), ida_k.len());
         }
 
         // Extra: show a sample of FPs and FNs for diagnosis (overall)
@@ -379,18 +379,17 @@ fn main() -> Result<()> {
             let xref_map: std::collections::HashMap<AddrPair, &Xref> =
                 xrefs.iter().map(|x| ((x.from.raw(), x.to.raw()), x)).collect();
 
-            let kind_filter = cli.dump_kind.as_deref();
+            let kind_filter = cli.dump_kind.as_deref().and_then(XrefKind::from_name);
 
             let matches_kind = |pair: &AddrPair, set: &HashSet<AddrPair>| -> bool {
                 if let Some(k) = kind_filter {
                     // Check if xr has this pair with the right kind
                     if let Some(x) = xref_map.get(pair) {
-                        return x.kind.name() == k;
+                        return x.kind.scored_kind() == k;
                     }
                     // For FNs (in ida_all but not xr_all), check ida kind
                     if set.contains(pair) && !xr_all.contains(pair) {
-                        // We'd need the ida kind — approximate: check ida_by_kind
-                        return ida_by_kind.get(k).is_some_and(|s| s.contains(pair));
+                        return ida_by_kind.get(&k).is_some_and(|s| s.contains(pair));
                     }
                     return false;
                 }
@@ -410,12 +409,12 @@ fn main() -> Result<()> {
                     .map(|(f, t)| {
                         let kind = xref_map
                             .get(&(*f, *t))
-                            .map(|x| x.kind.name())
+                            .map(|x| x.kind.scored_kind().name())
                             .unwrap_or_else(|| {
                                 // FN: determine kind from IDA
-                                for k in KINDS {
-                                    if ida_by_kind[k].contains(&(*f, *t)) {
-                                        return k;
+                                for &k in XrefKind::SCORED_KINDS {
+                                    if ida_by_kind[&k].contains(&(*f, *t)) {
+                                        return k.name();
                                     }
                                 }
                                 "unknown"

@@ -91,6 +91,50 @@ impl From<Va> for u64 {
     }
 }
 
+// ── VaRange ───────────────────────────────────────────────────────────────────
+
+/// A half-open virtual address range `[start, end)`.
+///
+/// Named alternative to raw `(Va, Va)` tuples, making the semantics of
+/// `from_range` / `to_range` filters self-documenting.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VaRange {
+    pub start: Va,
+    pub end: Va,
+}
+
+impl VaRange {
+    /// Create a new half-open range `[start, end)`.
+    #[inline]
+    pub fn new(start: Va, end: Va) -> Self {
+        Self { start, end }
+    }
+
+    /// Returns `true` if `va` is contained in `[start, end)`.
+    #[inline]
+    pub fn contains(self, va: Va) -> bool {
+        va >= self.start && va < self.end
+    }
+
+    /// Returns `true` if the range is empty (`start >= end`).
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+}
+
+impl std::fmt::Debug for VaRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VaRange(0x{:x}..0x{:x})", self.start.0, self.end.0)
+    }
+}
+
+impl std::fmt::Display for VaRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[0x{:x}, 0x{:x})", self.start.0, self.end.0)
+    }
+}
+
 // ── Serde ─────────────────────────────────────────────────────────────────────
 
 impl serde::Serialize for Va {

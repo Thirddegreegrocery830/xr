@@ -8,6 +8,14 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
 
+/// Default PIE base for ET_DYN ELF binaries whose lowest PT_LOAD has `p_vaddr == 0`.
+/// Matches the traditional Linux x86-64 / AArch64 PIE base and IDA default.
+const DEFAULT_PIE_BASE: u64 = 0x0040_0000;
+
+/// Alignment padding added after the highest PT_LOAD end when computing
+/// the base VA for synthetic external-function segments.
+const EXTERN_BASE_PAD: u64 = 0x20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     X86_64,
@@ -30,7 +38,7 @@ pub enum DecodeMode {
 
 /// A single mapped segment of the binary — executable or data.
 /// Backed by a byte slice into the mmap'd file. Zero copy.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Segment {
     /// Virtual address of the segment start.
     pub va: Va,
@@ -487,7 +495,7 @@ fn parse_elf(
             .min()
             .unwrap_or(1);
         if min_load_va == 0 {
-            base_override.unwrap_or(0x0040_0000)
+            base_override.unwrap_or(DEFAULT_PIE_BASE)
         } else {
             0
         }
@@ -689,7 +697,7 @@ fn build_elf_got_map(elf: &goblin::elf::Elf, pie_base: u64) -> HashMap<Va, Va> {
         .max()
         .unwrap_or(0)
         + pie_base
-        + 0x20;
+        + EXTERN_BASE_PAD;
 
     // Collect all SHN_UNDEF, non-STT_TLS symbols from .dynsym, by dynsym index.
     // We need the dynsym index (position in .dynsym) as the sort key.

@@ -477,7 +477,7 @@ mod tests {
         static TARGET: [u8; 4] = [0x00; 4];
         let code = fake_seg(0x1000, &CODE);
         let tgt = fake_seg(0x2000, &TARGET);
-        let segs = vec![code.clone(), tgt];
+        let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
@@ -501,7 +501,7 @@ mod tests {
         static TARGET: [u8; 4] = [0x00; 4];
         let code = fake_seg(0x1000, &CODE);
         let tgt = fake_seg(0x2000, &TARGET);
-        let segs = vec![code.clone(), tgt];
+        let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
@@ -524,7 +524,7 @@ mod tests {
         static TARGET: [u8; 4] = [0x00; 4];
         let code = fake_seg(0x1000, &CODE);
         let tgt = fake_seg(0x2000, &TARGET);
-        let segs = vec![code.clone(), tgt];
+        let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
@@ -544,7 +544,7 @@ mod tests {
         static TARGET: [u8; 8] = [0x00; 8];
         let code = fake_seg(0x1000, &CODE);
         let tgt = fake_seg(0x3000, &TARGET);
-        let segs = vec![code.clone(), tgt];
+        let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
@@ -572,7 +572,7 @@ mod tests {
         static TARGET: [u8; 4] = [0x00; 4];
         let code = fake_seg(0x1000, &CODE);
         let tgt = fake_seg(0x4000, &TARGET);
-        let segs = vec![code.clone(), tgt];
+        let segs = vec![fake_seg(0x1000, &CODE), tgt];
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
@@ -593,7 +593,7 @@ mod tests {
         static CODE: [u8; 5] = [0xe8, 0xfb, 0x0f, 0x00, 0x00]; // CALL 0x2000
                                                                // No segment at 0x2000
         let code = fake_seg(0x1000, &CODE);
-        let segs = vec![code.clone()];
+        let segs = vec![fake_seg(0x1000, &CODE)];
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
         let xrefs = scan_linear(&region_for(&code), &idx, &didx, &HashMap::new());

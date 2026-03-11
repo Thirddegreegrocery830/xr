@@ -9,7 +9,7 @@ pub mod xref;
 
 pub use loader::{Arch, DecodeMode, LoadedBinary, Segment};
 pub use pass::{Depth, PassConfig, PassResult, XrefPass};
-pub use va::Va;
+pub use va::{Va, VaRange};
 pub use xref::{Confidence, Xref, XrefKind};
 
 /// Parse a virtual address from a string.

@@ -5,7 +5,14 @@ use std::io::Write as _;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use xr::output::{ContextLine, CsvPrinter, JsonlPrinter, Printer, TextPrinter, XrefRecord};
-use xr::{parse_va, Depth, LoadedBinary, PassConfig, XrefPass};
+use xr::va::VaRange;
+use xr::{parse_va, Depth, LoadedBinary, PassConfig, Va, XrefPass};
+
+/// Capacity for the stdout BufWriter (4 MiB).
+///
+/// Batches are pre-formatted in parallel then flushed in one `write_all` call.
+/// A large buffer avoids frequent syscalls on high-throughput output.
+const STDOUT_BUF_CAPACITY: usize = 4 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "xr", about = "Fast multi-level xref extraction")]
@@ -115,19 +122,19 @@ fn main() -> Result<()> {
 
     let min_ref_va = cli
         .min_ref_va
-        .map(xr::Va)
+        .map(Va)
         .unwrap_or_else(|| binary.min_va());
 
     let from_range = match (cli.start, cli.end) {
-        (Some(lo), Some(hi)) => Some((xr::Va(lo), xr::Va(hi))),
-        (Some(lo), None) => Some((xr::Va(lo), xr::Va(u64::MAX))),
-        (None, Some(hi)) => Some((xr::Va(0), xr::Va(hi))),
+        (Some(lo), Some(hi)) => Some(VaRange::new(Va(lo), Va(hi))),
+        (Some(lo), None) => Some(VaRange::new(Va(lo), Va(u64::MAX))),
+        (None, Some(hi)) => Some(VaRange::new(Va(0), Va(hi))),
         (None, None) => None,
     };
     let to_range = match (cli.ref_start, cli.ref_end) {
-        (Some(lo), Some(hi)) => Some((xr::Va(lo), xr::Va(hi))),
-        (Some(lo), None) => Some((xr::Va(lo), xr::Va(u64::MAX))),
-        (None, Some(hi)) => Some((xr::Va(0), xr::Va(hi))),
+        (Some(lo), Some(hi)) => Some(VaRange::new(Va(lo), Va(hi))),
+        (Some(lo), None) => Some(VaRange::new(Va(lo), Va(u64::MAX))),
+        (None, Some(hi)) => Some(VaRange::new(Va(0), Va(hi))),
         (None, None) => None,
     };
 
@@ -161,7 +168,7 @@ fn main() -> Result<()> {
 
     // Single BufWriter — batches are pre-formatted in parallel then written
     // here in one write_all call per batch.
-    let mut stdout = std::io::BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout());
+    let mut stdout = std::io::BufWriter::with_capacity(STDOUT_BUF_CAPACITY, std::io::stdout());
 
     let hdr = printer.header_bytes();
     if !hdr.is_empty() {

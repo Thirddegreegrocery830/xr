@@ -2,9 +2,9 @@ use crate::arch::arm64;
 use crate::arch::x86_64;
 use crate::arch::{self, ScanRegion, SegmentDataIndex, SegmentIndex};
 use crate::loader::{Arch, DecodeMode, LoadedBinary, Segment};
-use crate::va::Va;
+use crate::va::{Va, VaRange};
 use crate::shard::split_range;
-use crate::xref::Xref;
+use crate::xref::{Confidence, Xref};
 use rayon::prelude::*;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +15,12 @@ use std::time::Instant;
 // thread.  Large enough that the output thread is rarely starved (scan batches
 // arrive in bursts), but small enough that we don't buffer all 171M xrefs in
 // memory if output falls behind.
+
+/// Default shard boundary overlap in bytes.
+///
+/// 64 bytes = 16 ARM64 instructions of lookahead.  This ensures instruction
+/// pairs (e.g. ADRP+LDR) straddling a shard boundary are still matched.
+const DEFAULT_BOUNDARY_OVERLAP: u64 = 64;
 
 /// Which analysis depth to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
@@ -46,11 +52,11 @@ pub struct PassConfig {
     /// Applied at shard-generation time — segments outside the range are skipped
     /// entirely, so no decode work is wasted.
     /// `None` = no restriction (scan everything).
-    pub from_range: Option<(Va, Va)>,
+    pub from_range: Option<VaRange>,
     /// Retain only xrefs whose `to` address falls in `[start, end)`.
     /// Applied as a post-filter after scanning.
     /// `None` = no restriction.
-    pub to_range: Option<(Va, Va)>,
+    pub to_range: Option<VaRange>,
 }
 
 impl Default for PassConfig {
@@ -58,7 +64,7 @@ impl Default for PassConfig {
         Self {
             depth: Depth::Paired,
             workers: 0,
-            boundary_overlap: 64, // 16 ARM64 instructions of lookahead
+            boundary_overlap: DEFAULT_BOUNDARY_OVERLAP,
             min_ref_va: Va::ZERO,
             from_range: None,
             to_range: None,
@@ -67,25 +73,41 @@ impl Default for PassConfig {
 }
 
 /// Breakdown of emitted xrefs by confidence level.
-#[derive(Debug, Default, Clone, Copy)]
+///
+/// Backed by an array indexed by [`Confidence`] discriminant (`repr(u8)`),
+/// so new variants are handled automatically without updating a match arm.
+#[derive(Debug, Clone, Copy)]
 pub struct ConfidenceCounts {
-    pub byte_scan: usize,
-    pub linear_immediate: usize,
-    pub pair_resolved: usize,
-    pub local_prop: usize,
-    pub function_flow: usize,
+    counts: [usize; Confidence::COUNT],
+}
+
+impl Default for ConfidenceCounts {
+    fn default() -> Self {
+        Self {
+            counts: [0; Confidence::COUNT],
+        }
+    }
 }
 
 impl ConfidenceCounts {
-    fn add(&mut self, c: crate::xref::Confidence) {
-        use crate::xref::Confidence::*;
-        match c {
-            ByteScan => self.byte_scan += 1,
-            LinearImmediate => self.linear_immediate += 1,
-            PairResolved => self.pair_resolved += 1,
-            LocalProp => self.local_prop += 1,
-            FunctionFlow => self.function_flow += 1,
-        }
+    fn add(&mut self, c: Confidence) {
+        self.counts[c as usize] += 1;
+    }
+
+    pub fn byte_scan(&self) -> usize {
+        self.counts[Confidence::ByteScan as usize]
+    }
+    pub fn linear_immediate(&self) -> usize {
+        self.counts[Confidence::LinearImmediate as usize]
+    }
+    pub fn pair_resolved(&self) -> usize {
+        self.counts[Confidence::PairResolved as usize]
+    }
+    pub fn local_prop(&self) -> usize {
+        self.counts[Confidence::LocalProp as usize]
+    }
+    pub fn function_flow(&self) -> usize {
+        self.counts[Confidence::FunctionFlow as usize]
     }
 }
 
@@ -110,7 +132,7 @@ impl PassResult {
         );
         eprintln!(
             "  byte-scan={} linear={} pair-resolved={} local-prop={} fn-flow={}",
-            cc.byte_scan, cc.linear_immediate, cc.pair_resolved, cc.local_prop, cc.function_flow,
+            cc.byte_scan(), cc.linear_immediate(), cc.pair_resolved(), cc.local_prop(), cc.function_flow(),
         );
     }
 }
@@ -203,7 +225,7 @@ impl<'a> XrefPass<'a> {
                 // Clamp to from_range before sharding — segments with no overlap
                 // produce an empty shard list and are skipped entirely.
                 let (scan_start, scan_end) = match from_range {
-                    Some((lo, hi)) => (seg.va.max(lo), seg_end.min(hi)),
+                    Some(r) => (seg.va.max(r.start), seg_end.min(r.end)),
                     None => (seg.va, seg_end),
                 };
                 if scan_start >= scan_end {
@@ -231,7 +253,7 @@ impl<'a> XrefPass<'a> {
                     let seg_end = seg.va + seg.data.len() as u64;
                     // Clamp to from_range (data pointers are emitted at their source VA).
                     let (scan_start, scan_end) = match from_range {
-                        Some((lo, hi)) => (seg.va.max(lo), seg_end.min(hi)),
+                        Some(r) => (seg.va.max(r.start), seg_end.min(r.end)),
                         None => (seg.va, seg_end),
                     };
                     if scan_start >= scan_end {
@@ -339,7 +361,7 @@ impl<'a> XrefPass<'a> {
                         batch.retain(|x| {
                             x.from < owned_end
                                 && (min_ref_va == Va::ZERO || x.to >= min_ref_va)
-                                && to_range.is_none_or(|(lo, hi)| x.to >= lo && x.to < hi)
+                                && to_range.is_none_or(|r| r.contains(x.to))
                         });
                         if !batch.is_empty() {
                             let _ = tx.send(batch);
@@ -358,7 +380,7 @@ impl<'a> XrefPass<'a> {
                         let mut batch = arch::byte_scan_pointers(&region, ctx.data_idx, ptr_size);
                         batch.retain(|x| {
                             (min_ref_va == Va::ZERO || x.to >= min_ref_va)
-                                && to_range.is_none_or(|(lo, hi)| x.to >= lo && x.to < hi)
+                                && to_range.is_none_or(|r| r.contains(x.to))
                         });
                         if !batch.is_empty() {
                             let _ = tx.send(batch);
@@ -874,7 +896,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((Va(base_va), Va(seg_end))),
+                from_range: Some(VaRange::new(Va(base_va), Va(seg_end))),
                 ..Default::default()
             },
         )
@@ -905,7 +927,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((Va(base_va), Va(midpoint))),
+                from_range: Some(VaRange::new(Va(base_va), Va(midpoint))),
                 ..Default::default()
             },
         )
@@ -941,7 +963,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((Va(midpoint), Va(seg_end))),
+                from_range: Some(VaRange::new(Va(midpoint), Va(seg_end))),
                 ..Default::default()
             },
         )
@@ -975,7 +997,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((Va(0xffff_0000), Va(0xffff_1000))), // nowhere near base_va
+                from_range: Some(VaRange::new(Va(0xffff_0000), Va(0xffff_1000))), // nowhere near base_va
                 ..Default::default()
             },
         )
@@ -1012,7 +1034,7 @@ mod tests {
                 PassConfig {
                     depth: Depth::Linear,
                     workers,
-                    from_range: Some((Va(q1), Va(q3))),
+                    from_range: Some(VaRange::new(Va(q1), Va(q3))),
                     ..Default::default()
                 },
             )
@@ -1051,7 +1073,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                to_range: Some((Va(target_va), Va(target_va + 4))),
+                to_range: Some(VaRange::new(Va(target_va), Va(target_va + 4))),
                 ..Default::default()
             },
         )
@@ -1085,7 +1107,7 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                to_range: Some((Va(0x1000_0000), Va(0x2000_0000))), // far from target_va
+                to_range: Some(VaRange::new(Va(0x1000_0000), Va(0x2000_0000))), // far from target_va
                 ..Default::default()
             },
         )
@@ -1129,8 +1151,8 @@ mod tests {
             PassConfig {
                 depth: Depth::Linear,
                 workers: 1,
-                from_range: Some((Va(base_a), Va(base_a + n as u64 * 4))),
-                to_range: Some((Va(target_a), Va(target_a + 4))),
+                from_range: Some(VaRange::new(Va(base_a), Va(base_a + n as u64 * 4))),
+                to_range: Some(VaRange::new(Va(target_a), Va(target_a + 4))),
                 ..Default::default()
             },
         )

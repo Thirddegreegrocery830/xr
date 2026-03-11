@@ -6,6 +6,13 @@ use crate::loader::{DecodeMode, Segment};
 use crate::va::Va;
 use crate::xref::{Confidence, Xref, XrefKind};
 
+/// Minimum target VA for exec-segment byte-scan pointers.
+///
+/// Values below this threshold are almost always 3-byte ASCII strings whose
+/// little-endian representation accidentally falls in the code segment VA range
+/// (e.g. `"ode\0…"` → `0x65646f`). No real 64-bit code pointer is below 16 MiB.
+const EXEC_TARGET_MIN_VA: u64 = 0x0100_0000;
+
 /// Everything a single-pass xref extractor needs to know about
 /// the region it's scanning.
 pub(crate) struct ScanRegion<'a> {
@@ -71,6 +78,11 @@ impl SegmentIndex {
             })
             .collect();
         entries.sort_unstable_by_key(|e| e.0);
+        // Detect overlapping segments — binary search assumes disjoint intervals.
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].1 <= w[1].0),
+            "SegmentIndex: overlapping segments detected (binary search may give wrong results)"
+        );
         Self { entries }
     }
 
@@ -158,6 +170,11 @@ impl SegmentDataIndex {
             })
             .collect();
         entries.sort_unstable_by_key(|e| e.0);
+        // Detect overlapping segments — binary search assumes disjoint intervals.
+        debug_assert!(
+            entries.windows(2).all(|w| w[0].1 <= w[1].0),
+            "SegmentDataIndex: overlapping segments detected (binary search may give wrong results)"
+        );
         Self { entries }
     }
 
@@ -248,7 +265,7 @@ pub(crate) fn byte_scan_pointers(
                 // Strings in data sections can form a value in the exec VA range
                 // from just 3 bytes (e.g. "ode\0…" → 0x65646f in a binary loaded
                 // at 0x400000). No real 64-bit code pointer is below 0x0100_0000.
-                Some(_) => target >= 0x0100_0000,
+                Some(_) => target >= EXEC_TARGET_MIN_VA,
                 // Target not in any mapped segment: skip.
                 None => false,
             };

@@ -13,7 +13,7 @@ pub struct Xref {
     pub confidence: Confidence,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum XrefKind {
     /// Direct call instruction (BL, CALL, etc.)
@@ -60,6 +60,19 @@ pub enum Confidence {
 }
 
 impl Confidence {
+    /// Number of `Confidence` variants. Used by `ConfidenceCounts` to size
+    /// its internal array. Must be kept in sync with the enum variants.
+    pub const COUNT: usize = 5;
+
+    /// All variants in discriminant order, for indexed iteration.
+    pub const ALL: [Confidence; Self::COUNT] = [
+        Self::ByteScan,
+        Self::LinearImmediate,
+        Self::PairResolved,
+        Self::LocalProp,
+        Self::FunctionFlow,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             Self::ByteScan => "byte-scan",
@@ -80,6 +93,27 @@ impl XrefKind {
     /// variants are retained in the enum for internal use (e.g. `is_code_ref`) but are
     /// effectively invisible in scored output — all scoring comparisons operate on
     /// `name()` strings.
+    /// The five canonical scoring categories.
+    ///
+    /// `CondJump`, `IndirectCall`, and `IndirectJump` collapse into their direct
+    /// counterparts when scored (via [`scored_kind`](Self::scored_kind)), so they
+    /// are not listed here.
+    pub const SCORED_KINDS: &[XrefKind] = &[
+        XrefKind::Call,
+        XrefKind::Jump,
+        XrefKind::DataRead,
+        XrefKind::DataWrite,
+        XrefKind::DataPointer,
+    ];
+
+    /// Short ASCII label used in text output, JSON serialisation, and benchmark scoring.
+    ///
+    /// `CondJump`, `IndirectCall`, and `IndirectJump` collapse to their direct
+    /// counterparts (`"jump"` / `"call"`) to match IDA Pro's output, which does not
+    /// distinguish conditionality or indirection in the xref kind label.  These three
+    /// variants are retained in the enum for internal use (e.g. `is_code_ref`) but are
+    /// effectively invisible in scored output — all scoring comparisons operate on
+    /// [`scored_kind`](Self::scored_kind).
     pub fn name(self) -> &'static str {
         match self {
             Self::Call | Self::IndirectCall => "call",
@@ -87,6 +121,35 @@ impl XrefKind {
             Self::DataRead => "data_read",
             Self::DataWrite => "data_write",
             Self::DataPointer => "data_ptr",
+        }
+    }
+
+    /// Maps variant-level xref kinds to the canonical scoring kind.
+    ///
+    /// `CondJump`/`IndirectJump` → `Jump`, `IndirectCall` → `Call`.
+    /// All others return themselves unchanged.  This is the enum equivalent
+    /// of [`name()`](Self::name) — use it for map keys instead of comparing
+    /// strings.
+    pub fn scored_kind(self) -> XrefKind {
+        match self {
+            Self::IndirectCall => Self::Call,
+            Self::CondJump | Self::IndirectJump => Self::Jump,
+            other => other,
+        }
+    }
+
+    /// Parse a scored-kind name (as produced by [`name()`](Self::name)) back
+    /// into a canonical `XrefKind`.
+    ///
+    /// Returns `None` for unrecognised strings.
+    pub fn from_name(s: &str) -> Option<XrefKind> {
+        match s {
+            "call" => Some(Self::Call),
+            "jump" => Some(Self::Jump),
+            "data_read" => Some(Self::DataRead),
+            "data_write" => Some(Self::DataWrite),
+            "data_ptr" => Some(Self::DataPointer),
+            _ => None,
         }
     }
 

@@ -485,7 +485,7 @@ mod tests {
         static TARGET: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
         let code_seg = fake_seg(0x1000, &CODE);
         let tgt_seg = fake_seg(0x1010, &TARGET);
-        let segs = vec![code_seg.clone(), tgt_seg];
+        let segs = vec![fake_seg(0x1000, &CODE), tgt_seg];
 
         let region = region_for(&code_seg);
         let idx = SegmentIndex::build(&segs);
@@ -509,7 +509,7 @@ mod tests {
         static TARGET: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
         let code_seg = fake_seg(0x1008, &CODE);
         let tgt_seg = fake_seg(0x1010, &TARGET);
-        let segs = vec![code_seg.clone(), tgt_seg];
+        let segs = vec![fake_seg(0x1008, &CODE), tgt_seg];
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
@@ -531,7 +531,7 @@ mod tests {
             0xe1, 0xff, 0xff, 0xb4, // CBZ X1, -4  at 0x1008
         ];
         let seg = fake_seg(0x1004, &CODE);
-        let segs = vec![seg.clone()];
+        let segs = vec![fake_seg(0x1004, &CODE)];
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
@@ -556,7 +556,7 @@ mod tests {
         static TARGET_PAGE: [u8; 0x200] = [0u8; 0x200];
         let code_seg = fake_seg(0x1000, &CODE);
         let data_seg = fake_seg(0x2000, &TARGET_PAGE);
-        let segs = vec![code_seg.clone(), data_seg];
+        let segs = vec![fake_seg(0x1000, &CODE), data_seg];
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
@@ -578,7 +578,7 @@ mod tests {
         static CODE: [u8; 4] = [0x04, 0x00, 0x00, 0x94]; // BL +16 → 0x1010
         let code_seg = fake_seg(0x1000, &CODE);
         // No segment covers 0x1010
-        let segs = vec![code_seg.clone()];
+        let segs = vec![fake_seg(0x1000, &CODE)];
 
         let idx = SegmentIndex::build(&segs);
         let didx = SegmentDataIndex::build(&segs);
