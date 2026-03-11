@@ -2,12 +2,21 @@
 ///
 /// Newtype wrapper around `u64` to prevent accidental mixing of virtual
 /// addresses with file offsets, sizes, or raw integer immediates.
+///
+/// Construction: use `Va::new(x)` or `Va::from(x)`.
+/// Extraction: use [`Va::raw()`] to get the inner `u64`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
-pub struct Va(pub u64);
+pub struct Va(u64);
 
 impl Va {
     pub const ZERO: Va = Va(0);
+
+    /// Construct a `Va` from a raw `u64` address.
+    #[inline]
+    pub const fn new(v: u64) -> Self {
+        Va(v)
+    }
 
     /// Raw `u64` value.
     #[inline]
@@ -149,13 +158,18 @@ impl VaRange {
 
 impl std::fmt::Debug for VaRange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "VaRange(0x{:x}..0x{:x})", self.start.0, self.end.0)
+        write!(
+            f,
+            "VaRange(0x{:x}..0x{:x})",
+            self.start.raw(),
+            self.end.raw()
+        )
     }
 }
 
 impl std::fmt::Display for VaRange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[0x{:x}, 0x{:x})", self.start.0, self.end.0)
+        write!(f, "[0x{:x}, 0x{:x})", self.start.raw(), self.end.raw())
     }
 }
 

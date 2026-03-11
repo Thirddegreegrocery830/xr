@@ -386,7 +386,7 @@ fn parse_dyld_cache(path: &Path) -> Result<DyldParseResult> {
         };
 
         segments.push(Segment {
-            va: Va(mapping.address),
+            va: Va::new(mapping.address),
             data,
             executable: mapping.is_executable(),
             readable: mapping.is_readable(),
@@ -561,11 +561,15 @@ fn parse_elf(
             if !secs.is_empty() {
                 for sec in &secs {
                     if sec.file_offset + sec.file_size > bytes.len() {
+                        eprintln!(
+                            "warning: ELF section '{}' at offset {:#x}+{:#x} exceeds file size, skipping",
+                            sec.name, sec.file_offset, sec.file_size
+                        );
                         continue;
                     }
                     let data = &bytes[sec.file_offset..sec.file_offset + sec.file_size];
                     segments.push(Segment {
-                        va: Va(sec.va), // already rebased above
+                        va: Va::new(sec.va), // already rebased above
                         data,
                         // Only mark executable if the section is actual code.
                         executable: sec.is_code,
@@ -582,7 +586,7 @@ fn parse_elf(
                     let bss_sz = (ph_va_end - last_end) as usize;
                     let bss_data: &'static [u8] = alloc_bss(bss_sz, bss_bufs);
                     segments.push(Segment {
-                        va: Va(last_end),
+                        va: Va::new(last_end),
                         data: bss_data,
                         executable: false,
                         readable: read,
@@ -611,7 +615,7 @@ fn parse_elf(
                     .iter()
                     .any(|s| !s.byte_scannable && s.va < ph_va_end && s.end > ph_va);
                 segments.push(Segment {
-                    va: Va(ph_va),
+                    va: Va::new(ph_va),
                     data,
                     executable: exec,
                     readable: read,
@@ -634,7 +638,7 @@ fn parse_elf(
             // zero-initialized and we never write it, this is safe.
             let bss_data: &'static [u8] = alloc_bss(bss_sz, bss_bufs);
             segments.push(Segment {
-                va: Va(bss_va),
+                va: Va::new(bss_va),
                 data: bss_data,
                 executable: false,
                 readable: read,
@@ -647,7 +651,7 @@ fn parse_elf(
     }
 
     let entry_points = if elf.entry != 0 {
-        vec![Va(elf.entry + pie_base)]
+        vec![Va::new(elf.entry + pie_base)]
     } else {
         vec![]
     };
@@ -660,7 +664,7 @@ fn parse_elf(
             if !name.is_empty() {
                 // ARM Thumb symbols have LSB set — strip it for the address.
                 // Apply pie_base after stripping the Thumb LSB.
-                let addr = Va((sym.st_value & !1) + pie_base);
+                let addr = Va::new((sym.st_value & !1) + pie_base);
                 symbols.push((name.to_string(), addr));
             }
         }
@@ -708,7 +712,7 @@ fn build_elf_got_slots(elf: &goblin::elf::Elf, pie_base: u64) -> HashSet<Va> {
         .chain(elf.dynrels.iter())
         .chain(elf.pltrelocs.iter())
         .filter(|rel| is_got_reloc(rel.r_type) && rel.r_sym != 0)
-        .map(|rel| Va(rel.r_offset + pie_base))
+        .map(|rel| Va::new(rel.r_offset + pie_base))
         .collect()
 }
 
@@ -719,21 +723,21 @@ fn build_elf_got_slots(elf: &goblin::elf::Elf, pie_base: u64) -> HashSet<Va> {
 /// strategy used by `SegmentIndex` in `arch::mod`.
 struct VaRangeSet {
     /// Sorted by start VA; assumed disjoint (same invariant as SegmentIndex).
-    ranges: Vec<(u64, u64)>,
+    ranges: Vec<(Va, Va)>,
 }
 
 impl VaRangeSet {
     fn build(segments: &[Segment]) -> Self {
-        let mut ranges: Vec<(u64, u64)> = segments
+        let mut ranges: Vec<(Va, Va)> = segments
             .iter()
-            .map(|s| (s.va.raw(), s.va.raw() + s.data.len() as u64))
+            .map(|s| (s.va, s.va + s.data.len() as u64))
             .collect();
         ranges.sort_unstable_by_key(|&(start, _)| start);
         Self { ranges }
     }
 
     #[inline]
-    fn contains(&self, va: u64) -> bool {
+    fn contains(&self, va: Va) -> bool {
         let idx = self.ranges.partition_point(|&(start, _)| start <= va);
         if idx == 0 {
             return false;
@@ -776,9 +780,9 @@ fn build_elf_reloc_pointers(
 
         if r_type == R_X86_64_RELATIVE || r_type == R_AARCH64_RELATIVE {
             // RELATIVE: target = pie_base + addend (no symbol lookup).
-            let target = (rel.r_addend.unwrap_or(0) as u64).wrapping_add(pie_base);
+            let target = Va::new((rel.r_addend.unwrap_or(0) as u64).wrapping_add(pie_base));
             if seg_set.contains(target) {
-                result.push((Va(from), Va(target)));
+                result.push((Va::new(from), target));
             }
         } else if r_type == R_X86_64_64 || r_type == R_AARCH64_ABS64 {
             // ABS64: target = sym.st_value + pie_base + addend (defined symbols only).
@@ -786,12 +790,13 @@ fn build_elf_reloc_pointers(
                 let sym = &elf.dynsyms.get(rel.r_sym).or_else(|| elf.syms.get(rel.r_sym));
                 if let Some(sym) = sym {
                     if sym.st_shndx != SHN_UNDEF as usize && sym.st_value != 0 {
-                        let target = sym
-                            .st_value
-                            .wrapping_add(pie_base)
-                            .wrapping_add(rel.r_addend.unwrap_or(0) as u64);
+                        let target = Va::new(
+                            sym.st_value
+                                .wrapping_add(pie_base)
+                                .wrapping_add(rel.r_addend.unwrap_or(0) as u64),
+                        );
                         if seg_set.contains(target) {
-                            result.push((Va(from), Va(target)));
+                            result.push((Va::new(from), target));
                         }
                     }
                 }
@@ -873,7 +878,7 @@ fn parse_macho(
             };
 
             segments.push(Segment {
-                va: Va(sect.addr),
+                va: Va::new(sect.addr),
                 data: section_data,
                 executable: exec,
                 readable: read,
@@ -885,15 +890,23 @@ fn parse_macho(
         }
     }
 
-    let entry_points = vec![Va(macho.entry)];
+    let entry_points = vec![Va::new(macho.entry)];
     let mut symbols = Vec::new();
     if let Some(syms) = macho.symbols.as_ref() {
         for (name, nlist) in syms.iter().flatten() {
             if !name.is_empty() && nlist.n_value != 0 {
-                symbols.push((name.to_string(), Va(nlist.n_value)));
+                symbols.push((name.to_string(), Va::new(nlist.n_value)));
             }
         }
     }
+
+    // Mach-O fixup chains (LC_DYLD_CHAINED_FIXUPS) and classic indirect
+    // symbol tables (LC_DYSYMTAB) are not yet parsed — reloc_pointers will
+    // be empty and some data_ptr xrefs will be missed.
+    eprintln!(
+        "note: Mach-O relocation parsing not yet implemented — \
+         some data_ptr xrefs may be missing"
+    );
 
     Ok(ParseResult {
         arch,
@@ -936,7 +949,7 @@ fn parse_pe(
         let exec = chars & IMAGE_SCN_MEM_EXECUTE != 0;
         let read = chars & IMAGE_SCN_MEM_READ != 0;
         let write = chars & IMAGE_SCN_MEM_WRITE != 0;
-        let va = Va(image_base + section.virtual_address as u64);
+        let va = Va::new(image_base + section.virtual_address as u64);
         let name = section.name().unwrap_or("?").to_string();
 
         // DWARF debug sections (goblin resolves COFF long-name offsets like "/35"
@@ -981,6 +994,10 @@ fn parse_pe(
         }
 
         if raw_offset + raw_size > bytes.len() {
+            eprintln!(
+                "warning: PE section '{}' at offset {:#x}+{:#x} exceeds file size, skipping",
+                name, raw_offset, raw_size
+            );
             continue;
         }
         let data = &bytes[raw_offset..raw_offset + raw_size];
@@ -1016,7 +1033,7 @@ fn parse_pe(
     }
 
     let entry_points = if pe.entry != 0 {
-        vec![Va(image_base + pe.entry as u64)]
+        vec![Va::new(image_base + pe.entry as u64)]
     } else {
         vec![]
     };
@@ -1024,7 +1041,7 @@ fn parse_pe(
     let mut symbols = Vec::new();
     for export in &pe.exports {
         if let Some(name) = export.name {
-            symbols.push((name.to_string(), Va(image_base + export.rva as u64)));
+            symbols.push((name.to_string(), Va::new(image_base + export.rva as u64)));
         }
     }
 
@@ -1091,8 +1108,8 @@ impl PeSectionMap {
     /// Read a little-endian u64 from the file at the given RVA.
     fn read_u64_at_rva(&self, bytes: &[u8], rva: u32) -> Option<u64> {
         let off = self.rva_to_file_offset(rva)?;
-        let slice = bytes.get(off..off + 8)?;
-        Some(u64::from_le_bytes(slice.try_into().unwrap()))
+        let slice: &[u8; 8] = bytes.get(off..off + 8)?.try_into().ok()?;
+        Some(u64::from_le_bytes(*slice))
     }
 }
 
@@ -1127,18 +1144,23 @@ fn build_pe_reloc_pointers(
             let reloc_bytes = bytes.get(base_off..base_off + reloc_size).unwrap_or(&[]);
             let mut pos = 0usize;
             while pos + 8 <= reloc_bytes.len() {
-                let page_rva =
-                    u32::from_le_bytes(reloc_bytes[pos..pos + 4].try_into().unwrap());
-                let block_size =
-                    u32::from_le_bytes(reloc_bytes[pos + 4..pos + 8].try_into().unwrap())
-                        as usize;
+                // Slices are exactly 4/8/2 bytes — bounds already checked
+                // by the `while` guard. Use array references for safe conversion.
+                let page_rva = u32::from_le_bytes(
+                    reloc_bytes[pos..pos + 4].try_into().expect("4-byte slice"),
+                );
+                let block_size = u32::from_le_bytes(
+                    reloc_bytes[pos + 4..pos + 8].try_into().expect("4-byte slice"),
+                ) as usize;
                 if block_size < 8 || pos + block_size > reloc_bytes.len() {
                     break;
                 }
                 let mut entry_pos = pos + 8;
                 while entry_pos + 2 <= pos + block_size {
                     let entry = u16::from_le_bytes(
-                        reloc_bytes[entry_pos..entry_pos + 2].try_into().unwrap(),
+                        reloc_bytes[entry_pos..entry_pos + 2]
+                            .try_into()
+                            .expect("2-byte slice"),
                     );
                     let rel_type = entry >> 12;
                     let offset = entry & 0x0FFF;
@@ -1146,8 +1168,8 @@ fn build_pe_reloc_pointers(
                         let slot_rva = page_rva + offset as u32;
                         let slot_va = image_base + slot_rva as u64;
                         if let Some(ptr_val) = sec_map.read_u64_at_rva(bytes, slot_rva) {
-                            if ptr_val != 0 && seg_set.contains(ptr_val) {
-                                result.push((Va(slot_va), Va(ptr_val)));
+                            if ptr_val != 0 && seg_set.contains(Va::new(ptr_val)) {
+                                result.push((Va::new(slot_va), Va::new(ptr_val)));
                             }
                         }
                     }
@@ -1289,7 +1311,7 @@ mod tests {
         assert_eq!(binary.pie_base, 0x0040_0000);
         // Every segment VA must be >= pie_base (they were raw-vaddr=0 or small offsets).
         assert!(
-            binary.segments.iter().all(|s| s.va >= Va(0x0040_0000)),
+            binary.segments.iter().all(|s| s.va >= Va::new(0x0040_0000)),
             "all segment VAs should be rebased above 0x400000, got: {:?}",
             binary.segments.iter().map(|s| s.va).collect::<Vec<_>>()
         );

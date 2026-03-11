@@ -146,13 +146,13 @@ fn main() -> Result<()> {
         binary.entry_points.len()
     );
 
-    let min_ref_va = cli
+    let min_ref_va = Some(cli
         .min_ref_va
-        .map(Va)
-        .unwrap_or_else(|| binary.min_va());
+        .map(Va::new)
+        .unwrap_or_else(|| binary.min_va()));
 
-    let from_range = VaRange::from_bounds(cli.start.map(Va), cli.end.map(Va));
-    let to_range = VaRange::from_bounds(cli.ref_start.map(Va), cli.ref_end.map(Va));
+    let from_range = VaRange::from_bounds(cli.start.map(Va::new), cli.end.map(Va::new));
+    let to_range = VaRange::from_bounds(cli.ref_start.map(Va::new), cli.ref_end.map(Va::new));
 
     let config = PassConfig {
         depth,

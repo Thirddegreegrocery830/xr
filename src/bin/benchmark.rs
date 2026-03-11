@@ -195,7 +195,7 @@ fn run_pass(
     depth: Depth,
     workers: usize,
     runs: usize,
-    min_ref_va: xr::Va,
+    min_ref_va: Option<xr::Va>,
 ) -> (Vec<Xref>, u64) {
     let mut best_ms = u64::MAX;
     let mut last_xrefs = Vec::new();
@@ -228,17 +228,37 @@ fn run_pass(
 
 /// For x86-64: if the instruction at `from_va` is `CALL [RIP+disp32]` (FF 15)
 /// or `JMP [RIP+disp32]` (FF 25), return the GOT slot VA.  Otherwise `None`.
+///
+/// Uses `iced-x86` for correct decoding (handles REX prefixes, segment
+/// overrides, and other encoding variants that raw byte matching misses).
 fn resolve_x86_got_slot(binary: &LoadedBinary, from_va: Va) -> Option<Va> {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind, Register};
+
     let seg = binary.segment_at(from_va)?;
     let offset = (from_va.raw() - seg.va.raw()) as usize;
-    let bytes = seg.data().get(offset..offset + 6)?;
-    // FF 15 xx xx xx xx = CALL [RIP+disp32]
-    // FF 25 xx xx xx xx = JMP  [RIP+disp32]
-    if bytes[0] == 0xFF && (bytes[1] == 0x15 || bytes[1] == 0x25) {
-        let disp = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-        let next_ip = from_va.raw() + 6;
-        let got_slot = next_ip.wrapping_add(disp as i64 as u64);
-        Some(Va(got_slot))
+    // Decode needs at most 15 bytes (max x86 instruction length).
+    let end = (offset + 15).min(seg.data().len());
+    let bytes = seg.data().get(offset..end)?;
+
+    let mut decoder = Decoder::with_ip(64, bytes, from_va.raw(), DecoderOptions::NONE);
+    if !decoder.can_decode() {
+        return None;
+    }
+    let insn = decoder.decode();
+    if insn.is_invalid() {
+        return None;
+    }
+
+    // Must be an indirect call or jump through RIP-relative memory.
+    let fc = insn.flow_control();
+    if !matches!(fc, FlowControl::IndirectCall | FlowControl::IndirectBranch) {
+        return None;
+    }
+    if insn.op_count() >= 1
+        && insn.op0_kind() == OpKind::Memory
+        && insn.memory_base() == Register::RIP
+    {
+        Some(Va::new(insn.memory_displacement64()))
     } else {
         None
     }
@@ -309,8 +329,8 @@ fn main() -> Result<()> {
     }
 
     for x in ida_raw {
-        let from = Va(x.from.wrapping_add(va_offset));
-        let mut to = Va(x.to.wrapping_add(va_offset));
+        let from = Va::new(x.from.wrapping_add(va_offset));
+        let mut to = Va::new(x.to.wrapping_add(va_offset));
 
         // Normalize IDA extern-target call/jump xrefs to GOT slot VAs.
         if to.raw() >= ext_bound
@@ -353,10 +373,10 @@ fn main() -> Result<()> {
     }
     println!();
 
-    let min_ref_va = cli
+    let min_ref_va = Some(cli
         .min_ref_va
-        .map(Va)
-        .unwrap_or_else(|| binary.min_va());
+        .map(Va::new)
+        .unwrap_or_else(|| binary.min_va()));
     println!(
         "binary       : {}  arch={:?}  segments={}",
         cli.binary.display(),

@@ -60,18 +60,19 @@ pub enum Confidence {
 }
 
 impl Confidence {
-    /// Number of `Confidence` variants. Used by `ConfidenceCounts` to size
-    /// its internal array. Must be kept in sync with the enum variants.
-    pub const COUNT: usize = 5;
-
     /// All variants in discriminant order, for indexed iteration.
-    pub const ALL: [Confidence; Self::COUNT] = [
+    /// `COUNT` is derived from this — adding a variant here automatically
+    /// updates the array size used by `ConfidenceCounts`.
+    pub const ALL: [Confidence; 5] = [
         Self::ByteScan,
         Self::LinearImmediate,
         Self::PairResolved,
         Self::LocalProp,
         Self::FunctionFlow,
     ];
+
+    /// Number of `Confidence` variants. Derived from [`ALL`](Self::ALL).
+    pub const COUNT: usize = Self::ALL.len();
 
     pub fn name(self) -> &'static str {
         match self {
@@ -154,20 +155,17 @@ impl XrefKind {
     }
 
     pub fn is_code_ref(self) -> bool {
-        matches!(
-            self,
+        match self {
             XrefKind::Call
-                | XrefKind::Jump
-                | XrefKind::CondJump
-                | XrefKind::IndirectCall
-                | XrefKind::IndirectJump
-        )
+            | XrefKind::Jump
+            | XrefKind::CondJump
+            | XrefKind::IndirectCall
+            | XrefKind::IndirectJump => true,
+            XrefKind::DataRead | XrefKind::DataWrite | XrefKind::DataPointer => false,
+        }
     }
 
     pub fn is_data_ref(self) -> bool {
-        matches!(
-            self,
-            XrefKind::DataRead | XrefKind::DataWrite | XrefKind::DataPointer
-        )
+        !self.is_code_ref()
     }
 }

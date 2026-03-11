@@ -279,7 +279,7 @@ mod tests {
 
     fn exec_seg(va: u64, data: &'static [u8]) -> Segment {
         Segment {
-            va: crate::va::Va(va),
+            va: crate::va::Va::new(va),
             data,
             executable: true,
             readable: true,

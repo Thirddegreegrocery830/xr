@@ -62,28 +62,38 @@ pub(crate) struct SegmentIndex {
 pub(crate) const FLAG_EXEC: u8 = 0b01;
 pub(crate) const FLAG_WRITE: u8 = 0b10;
 
+/// Compute the attribute bitmask for a segment.
+#[inline]
+fn segment_flags(s: &Segment) -> u8 {
+    let mut flags = 0u8;
+    if s.executable {
+        flags |= FLAG_EXEC;
+    }
+    if s.writable {
+        flags |= FLAG_WRITE;
+    }
+    flags
+}
+
+/// Warn (once per build) if sorted intervals overlap — binary search may give
+/// wrong results on malformed binaries.
+fn check_disjoint(label: &str, entries: &[(Va, Va)]) {
+    if !entries.windows(2).all(|w| w[0].1 <= w[1].0) {
+        eprintln!("warning: {label}: overlapping segments detected (binary search may give wrong results)");
+    }
+}
+
 impl SegmentIndex {
     pub(crate) fn build(segments: &[Segment]) -> Self {
         let mut entries: Vec<(Va, Va, u8)> = segments
             .iter()
-            .map(|s| {
-                let mut flags = 0u8;
-                if s.executable {
-                    flags |= FLAG_EXEC;
-                }
-                if s.writable {
-                    flags |= FLAG_WRITE;
-                }
-                (s.va, s.va + s.data.len() as u64, flags)
-            })
+            .map(|s| (s.va, s.va + s.data.len() as u64, segment_flags(s)))
             .collect();
         entries.sort_unstable_by_key(|e| e.0);
-        // Binary search assumes disjoint intervals.  Warn (don't panic) if a
-        // malformed binary has overlapping segments — wrong results are better
-        // than a crash in production.
-        if !entries.windows(2).all(|w| w[0].1 <= w[1].0) {
-            eprintln!("warning: SegmentIndex: overlapping segments detected (binary search may give wrong results)");
-        }
+        check_disjoint(
+            "SegmentIndex",
+            &entries.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(),
+        );
         Self { entries }
     }
 
@@ -108,13 +118,12 @@ impl SegmentIndex {
     /// Binary-search for the entry covering `va`. Returns the flags byte.
     #[inline]
     fn entry_at(&self, va: Va) -> Option<u8> {
-        // Find the last entry whose start <= va.
         let idx = self.entries.partition_point(|e| e.0 <= va);
         if idx == 0 {
             return None;
         }
         let (start, end, flags) = self.entries[idx - 1];
-        if va < end && va >= start {
+        if va >= start && va < end {
             Some(flags)
         } else {
             None
@@ -149,26 +158,18 @@ impl<'a> SegmentDataIndex<'a> {
     pub(crate) fn build(segments: &'a [crate::loader::Segment]) -> Self {
         let mut entries: Vec<DataIndexEntry<'a>> = segments
             .iter()
-            .map(|s| {
-                let mut flags = 0u8;
-                if s.executable {
-                    flags |= FLAG_EXEC;
-                }
-                if s.writable {
-                    flags |= FLAG_WRITE;
-                }
-                DataIndexEntry {
-                    start: s.va,
-                    end: s.va + s.data.len() as u64,
-                    flags,
-                    data: s.data,
-                }
+            .map(|s| DataIndexEntry {
+                start: s.va,
+                end: s.va + s.data.len() as u64,
+                flags: segment_flags(s),
+                data: s.data,
             })
             .collect();
         entries.sort_unstable_by_key(|e| e.start);
-        if !entries.windows(2).all(|w| w[0].end <= w[1].start) {
-            eprintln!("warning: SegmentDataIndex: overlapping segments detected (binary search may give wrong results)");
-        }
+        check_disjoint(
+            "SegmentDataIndex",
+            &entries.iter().map(|e| (e.start, e.end)).collect::<Vec<_>>(),
+        );
         Self { entries }
     }
 
@@ -198,7 +199,9 @@ impl<'a> SegmentDataIndex<'a> {
         }
         let offset = (va - e.start) as usize;
         let bytes = e.data.get(offset..offset + 8)?;
-        Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+        Some(u64::from_le_bytes(
+            bytes.try_into().expect("slice is exactly 8 bytes"),
+        ))
     }
 
     /// Returns the flags byte for the segment covering `va`, or `None` if unmapped.
@@ -217,7 +220,9 @@ impl<'a> SegmentDataIndex<'a> {
         let e = self.entry_at(va)?;
         let offset = (va - e.start) as usize;
         let bytes = e.data.get(offset..offset + 4)?;
-        Some(i32::from_le_bytes(bytes.try_into().unwrap()))
+        Some(i32::from_le_bytes(
+            bytes.try_into().expect("slice is exactly 4 bytes"),
+        ))
     }
 }
 
@@ -249,14 +254,16 @@ pub(crate) fn byte_scan_pointers(
 
     let mut i = 0usize;
     while i <= end {
+        // Loop bound guarantees `i + pointer_size <= data.len()`, so slices
+        // are always exactly the right length for the array conversion.
         let target = if pointer_size == 8 {
-            u64::from_le_bytes(data[i..i + 8].try_into().unwrap())
+            u64::from_le_bytes(data[i..i + 8].try_into().expect("8-byte slice"))
         } else {
-            u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as u64
+            u32::from_le_bytes(data[i..i + 4].try_into().expect("4-byte slice")) as u64
         };
 
         if target != 0 {
-            let target_va = Va(target);
+            let target_va = Va::new(target);
             let emit = match data_idx.flags_at(target_va) {
                 // Target in a non-exec segment: always emit.
                 Some(f) if f & FLAG_EXEC == 0 => true,

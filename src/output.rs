@@ -22,7 +22,8 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         if i > 0 {
             s.push(' ');
         }
-        write!(s, "{b:02x}").unwrap();
+        // Writing to a String is infallible — fmt::Write for String never errors.
+        let _ = write!(s, "{b:02x}");
     }
     s
 }

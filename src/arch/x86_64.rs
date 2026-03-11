@@ -127,22 +127,22 @@ fn scan_core(
                         let reg = insn.op0_register();
                         if let Some(ri) = gpr_index(reg) {
                             if let Some(known) = reg_vals[ri] {
-                                if idx.contains(Va(known)) {
+                                if idx.contains(Va::new(known)) {
                                     let kind = if insn.code() == Code::Call_rm64 {
                                         XrefKind::Call
                                     } else {
                                         XrefKind::Jump
                                     };
                                     xrefs.push(Xref {
-                                        from: Va(va),
-                                        to: Va(known),
+                                        from: Va::new(va),
+                                        to: Va::new(known),
                                         kind,
                                         confidence: Confidence::LocalProp,
                                     });
                                 }
                             } else if insn.code() == Code::Jmp_rm64 {
                                 if let Some(jt) = jt_info[ri] {
-                                    recover_jump_table(Va(va), jt, data_idx, idx, &mut xrefs);
+                                    recover_jump_table(Va::new(va), jt, data_idx, idx, &mut xrefs);
                                 }
                             }
                         }
@@ -155,10 +155,10 @@ fn scan_core(
         // Immediate-as-pointer.
         if region_is_exec {
             if let Some(imm) = imm_as_address(&insn) {
-                if idx.contains(Va(imm)) {
+                if idx.contains(Va::new(imm)) {
                     xrefs.push(Xref {
-                        from: Va(va),
-                        to: Va(imm),
+                        from: Va::new(va),
+                        to: Va::new(imm),
                         kind: XrefKind::DataPointer,
                         confidence: Confidence::LinearImmediate,
                     });
@@ -211,7 +211,7 @@ fn emit_direct_branches(
         // jump — execution either enters the transaction or jumps to the handler.
         | iced_x86::FlowControl::XbeginXabortXend => {
             if let Some(target) = direct_target(insn) {
-                if idx.contains(Va(target)) {
+                if idx.contains(Va::new(target)) {
                     let kind = match insn.flow_control() {
                         iced_x86::FlowControl::Call => XrefKind::Call,
                         iced_x86::FlowControl::UnconditionalBranch => XrefKind::Jump,
@@ -224,8 +224,8 @@ fn emit_direct_branches(
                         ),
                     };
                     xrefs.push(Xref {
-                        from: Va(va),
-                        to: Va(target),
+                        from: Va::new(va),
+                        to: Va::new(target),
                         kind,
                         confidence: Confidence::LinearImmediate,
                     });
@@ -264,7 +264,7 @@ fn emit_got_indirect(
         && insn.op0_kind() == OpKind::Memory
         && insn.memory_base() == Register::RIP
     {
-        let got_slot_va = Va(insn.memory_displacement64());
+        let got_slot_va = Va::new(insn.memory_displacement64());
         if got_slots.contains(&got_slot_va) {
             let kind = if insn.flow_control() == FlowControl::IndirectCall {
                 XrefKind::Call
@@ -272,7 +272,7 @@ fn emit_got_indirect(
                 XrefKind::Jump
             };
             xrefs.push(Xref {
-                from: Va(va),
+                from: Va::new(va),
                 to: got_slot_va,
                 kind,
                 confidence: Confidence::LinearImmediate,
@@ -305,8 +305,8 @@ fn emit_rip_relative(
     for op_idx in 0..insn.op_count() {
         if insn.op_kind(op_idx) == OpKind::Memory && insn.memory_base() == Register::RIP {
             let target = insn.memory_displacement64();
-            if idx.contains(Va(target)) {
-                let target_is_exec = idx.is_exec(Va(target));
+            if idx.contains(Va::new(target)) {
+                let target_is_exec = idx.is_exec(Va::new(target));
                 let is_lea = matches!(
                     insn.code(),
                     Code::Lea_r16_m | Code::Lea_r32_m | Code::Lea_r64_m
@@ -322,8 +322,8 @@ fn emit_rip_relative(
                 // For non-LEA: suppress if target is exec (IDA doesn't record these)
                 if is_lea || !target_is_exec {
                     xrefs.push(Xref {
-                        from: Va(va),
-                        to: Va(target),
+                        from: Va::new(va),
+                        to: Va::new(target),
                         kind,
                         confidence: Confidence::LinearImmediate,
                     });
@@ -421,13 +421,13 @@ fn update_jt_state(
                 if let Some(bi) = gpr_index(insn.memory_base()) {
                     if let Some(base_val) = reg_vals[bi] {
                         let table_start =
-                            Va(base_val.wrapping_add(insn.memory_displacement64()));
+                            Va::new(base_val.wrapping_add(insn.memory_displacement64()));
                         // Look up the CMP bound for the index register
                         let max_entries =
                             gpr_index(insn.memory_index()).and_then(|ii| cmp_bound[ii]);
                         jt_info[di] = Some(JumpTableInfo {
                             table_start,
-                            target_base: Va(base_val),
+                            target_base: Va::new(base_val),
                             max_entries,
                         });
                         return;
@@ -568,7 +568,7 @@ fn recover_jump_table(
         let Some(offset) = data_idx.read_i32_at(slot_va) else {
             break;
         };
-        let target = Va((jt.target_base.raw() as i64).wrapping_add(offset as i64) as u64);
+        let target = Va::new((jt.target_base.raw() as i64).wrapping_add(offset as i64) as u64);
         if !seg_idx.is_exec(target) {
             break;
         }
@@ -677,7 +677,7 @@ mod tests {
 
     fn fake_seg(va: u64, data: &'static [u8]) -> Segment {
         Segment {
-            va: Va(va),
+            va: Va::new(va),
             data,
             executable: true,
             readable: true,
@@ -690,7 +690,7 @@ mod tests {
 
     fn fake_data_seg(va: u64, data: &'static [u8]) -> Segment {
         Segment {
-            va: Va(va),
+            va: Va::new(va),
             data,
             executable: false,
             readable: true,
@@ -720,8 +720,8 @@ mod tests {
         let data_idx = SegmentDataIndex::build(&segs);
         let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
         assert_eq!(xrefs.len(), 1);
-        assert_eq!(xrefs[0].from, Va(0x1000));
-        assert_eq!(xrefs[0].to, Va(0x2000));
+        assert_eq!(xrefs[0].from, Va::new(0x1000));
+        assert_eq!(xrefs[0].to, Va::new(0x2000));
         assert_eq!(xrefs[0].kind, XrefKind::Call);
         assert_eq!(xrefs[0].confidence, Confidence::LinearImmediate);
     }
@@ -744,8 +744,8 @@ mod tests {
         let data_idx = SegmentDataIndex::build(&segs);
         let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
         let jmp = xrefs.iter().find(|x| x.kind == XrefKind::Jump).unwrap();
-        assert_eq!(jmp.from, Va(0x1005));
-        assert_eq!(jmp.to, Va(0x2000));
+        assert_eq!(jmp.from, Va::new(0x1005));
+        assert_eq!(jmp.to, Va::new(0x2000));
     }
 
     // ── JE rel32 (conditional) ────────────────────────────────────────────────
@@ -767,8 +767,8 @@ mod tests {
         let data_idx = SegmentDataIndex::build(&segs);
         let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
         let je = xrefs.iter().find(|x| x.kind == XrefKind::CondJump).unwrap();
-        assert_eq!(je.from, Va(0x100a));
-        assert_eq!(je.to, Va(0x2000));
+        assert_eq!(je.from, Va::new(0x100a));
+        assert_eq!(je.to, Va::new(0x2000));
     }
 
     // ── LEA rax, [rip + disp32] ───────────────────────────────────────────────
@@ -791,8 +791,8 @@ mod tests {
             .iter()
             .find(|x| x.kind == XrefKind::DataPointer)
             .unwrap();
-        assert_eq!(lea.from, Va(0x1000));
-        assert_eq!(lea.to, Va(0x3000));
+        assert_eq!(lea.from, Va::new(0x1000));
+        assert_eq!(lea.to, Va::new(0x3000));
         assert_eq!(lea.confidence, Confidence::LinearImmediate);
     }
 
@@ -818,8 +818,8 @@ mod tests {
             .iter()
             .find(|x| x.confidence == Confidence::LocalProp)
             .expect("expected a LocalProp xref");
-        assert_eq!(prop.from, Va(0x100a));
-        assert_eq!(prop.to, Va(0x4000));
+        assert_eq!(prop.from, Va::new(0x100a));
+        assert_eq!(prop.to, Va::new(0x4000));
         assert_eq!(prop.kind, XrefKind::Call);
     }
 
@@ -889,8 +889,8 @@ mod tests {
             .filter(|x| x.kind == XrefKind::Jump && x.confidence == Confidence::LocalProp)
             .collect();
         assert_eq!(jumps.len(), 2, "expected 2 jump table targets, got {}", jumps.len());
-        assert!(jumps.iter().any(|x| x.from == Va(0x1013) && x.to == Va(0x2000)));
-        assert!(jumps.iter().any(|x| x.from == Va(0x1013) && x.to == Va(0x2004)));
+        assert!(jumps.iter().any(|x| x.from == Va::new(0x1013) && x.to == Va::new(0x2000)));
+        assert!(jumps.iter().any(|x| x.from == Va::new(0x1013) && x.to == Va::new(0x2004)));
     }
 
     /// Jump table with forward offsets (positive i32 values) and CMP bound.
@@ -931,8 +931,8 @@ mod tests {
             .filter(|x| x.kind == XrefKind::Jump && x.confidence == Confidence::LocalProp)
             .collect();
         assert_eq!(jumps.len(), 2);
-        assert!(jumps.iter().any(|x| x.from == Va(0x1013) && x.to == Va(0x4000)));
-        assert!(jumps.iter().any(|x| x.from == Va(0x1013) && x.to == Va(0x4100)));
+        assert!(jumps.iter().any(|x| x.from == Va::new(0x1013) && x.to == Va::new(0x4000)));
+        assert!(jumps.iter().any(|x| x.from == Va::new(0x1013) && x.to == Va::new(0x4100)));
     }
 
     /// No jump xrefs when table entries don't resolve to executable addresses.

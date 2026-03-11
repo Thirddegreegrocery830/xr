@@ -52,9 +52,9 @@ pub fn split_range(
             if shard_start >= end {
                 return None; // alignment pushed us past the end
             }
-            let raw_end = start + (i + 1) * chunk;
+            let raw_end = start.saturating_add((i + 1).saturating_mul(chunk));
             // End does not need alignment — the arch scanner will handle tail bytes
-            let shard_end = (raw_end + overlap).min(end);
+            let shard_end = raw_end.saturating_add(overlap).min(end);
             Some((shard_start, shard_end))
         })
         .collect()
