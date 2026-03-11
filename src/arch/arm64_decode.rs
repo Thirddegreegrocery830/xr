@@ -50,10 +50,14 @@ pub enum Arm64Insn {
     Adr(u32),
     /// ADD (immediate) Xd/Wd, Xn/Wn, #imm
     AddImm(u32),
-    /// LDR (unsigned offset, 64-bit)
+    /// LDR (unsigned offset) — any size (byte/half/word/doubleword).
+    /// Use `ldr_str_size()` for the access width (0=B, 1=H, 2=W, 3=X).
     Ldr(u32),
-    /// STR (unsigned offset, 64-bit)
+    /// STR (unsigned offset) — any size.
     Str(u32),
+    /// LDR (literal) — PC-relative, imm19 scaled by 4.
+    /// Covers LDR Xt/Wt, `label` and LDRSW Xt, `label`.
+    LdrLiteral(u32),
     /// BLR Xn
     Blr(u32),
     /// BR Xn
@@ -100,12 +104,22 @@ impl Arm64Insn {
         if word & 0x1F00_0000 == 0x1100_0000 && word & 0x2000_0000 == 0 {
             return true;
         }
-        // LDR (unsigned offset, 64-bit) — mask 0xFFC0_0000 match 0xF940_0000
-        if word & 0xFFC0_0000 == 0xF940_0000 {
+        // LDR (unsigned offset, any size) — bits[29:27]=111, bit[26]=0 (not SIMD),
+        // bits[25:24]=01, bits[23:22]=01 (opc=LDR).
+        // Covers: LDRB(00), LDRH(01), LDR W(10), LDR X(11).
+        // Common mask: 0x3FC0_0000, match: 0x3940_0000
+        if word & 0x3FC0_0000 == 0x3940_0000 {
             return true;
         }
-        // STR (unsigned offset, 64-bit) — mask 0xFFC0_0000 match 0xF900_0000
-        if word & 0xFFC0_0000 == 0xF900_0000 {
+        // STR (unsigned offset, any size) — same layout, opc=00 (STR).
+        // Common mask: 0x3FC0_0000, match: 0x3900_0000
+        if word & 0x3FC0_0000 == 0x3900_0000 {
+            return true;
+        }
+        // LDR (literal) — PC-relative: LDR Wt (0x18), LDR Xt (0x58), LDRSW (0x98)
+        // bits[29:24]=011000, V=0 (bit[26]=0). Mask bits[29:24,26]: 0x3F00_0000=0x18
+        // opc(bits[31:30]): 00=LDR W, 01=LDR X, 10=LDRSW
+        if word & 0x3F00_0000 == 0x1800_0000 {
             return true;
         }
         false
@@ -192,17 +206,25 @@ impl Arm64Insn {
             }
         }
 
-        // LDR (unsigned offset, 64-bit): size=11, V=0, opc=01
-        // Encoding: 1111_1001_01xx_xxxx_xxxx_xxxx_xxxx_xxxx
-        // Mask 0xFFC0_0000, match 0xF940_0000
-        if word & 0xFFC0_0000 == 0xF940_0000 {
+        // LDR (unsigned offset, any size): size|111_001_01|imm12|Rn|Rt
+        // Covers LDRB (size=00), LDRH (01), LDR W (10), LDR X (11).
+        // V=0 (bit26) excludes SIMD/FP variants.
+        // Mask: 0x3FC0_0000 (bits[29:22]), match: 0x3940_0000
+        if word & 0x3FC0_0000 == 0x3940_0000 {
             return Arm64Insn::Ldr(word);
         }
 
-        // STR (unsigned offset, 64-bit): size=11, V=0, opc=00
-        // Mask 0xFFC0_0000, match 0xF900_0000
-        if word & 0xFFC0_0000 == 0xF900_0000 {
+        // STR (unsigned offset, any size): size|111_001_00|imm12|Rn|Rt
+        // V=0 (bit26) excludes SIMD/FP variants.
+        // Mask: 0x3FC0_0000, match: 0x3900_0000
+        if word & 0x3FC0_0000 == 0x3900_0000 {
             return Arm64Insn::Str(word);
+        }
+
+        // LDR (literal) — PC-relative: imm19 at bits[23:5], scaled ×4.
+        // bits[29:24]=011000, V=0. opc=bits[31:30]: 00=W, 01=X, 10=LDRSW.
+        if word & 0x3F00_0000 == 0x1800_0000 {
+            return Arm64Insn::LdrLiteral(word);
         }
 
         Arm64Insn::Other(word)
@@ -304,11 +326,28 @@ impl Arm64Insn {
         ((word >> 10) & 0xFFF) as u64
     }
 
-    /// LDR/STR (unsigned offset): unsigned imm12, bits [21:10], scaled by 8 (64-bit).
+    /// Access size for LDR/STR (unsigned offset): bits [31:30].
+    /// 0 = byte, 1 = halfword, 2 = word (32-bit), 3 = doubleword (64-bit).
+    #[inline]
+    pub fn ldr_str_size(&self) -> u8 {
+        (self.word() >> 30) as u8
+    }
+
+    /// LDR/STR (unsigned offset): unsigned imm12, bits [21:10], scaled by access size.
+    /// Scale: byte=1, half=2, word=4, doubleword=8.
     #[inline]
     pub fn ldr_str_offset(&self) -> u64 {
         let imm12 = (self.word() >> 10) & 0xFFF;
-        imm12 as u64 * 8 // 64-bit = scale by 8
+        let scale = 1u64 << self.ldr_str_size();
+        imm12 as u64 * scale
+    }
+
+    /// LDR (literal): sign-extended imm19 at bits [23:5], scaled by 4, added to PC.
+    #[inline]
+    pub fn ldr_literal_target(&self, pc: u64) -> u64 {
+        let imm19 = (self.word() >> 5) & 0x0007_FFFF;
+        let sext = (imm19 as i32) << 13 >> 13;
+        pc.wrapping_add((sext as i64 * 4) as u64)
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -328,6 +367,7 @@ impl Arm64Insn {
             | Arm64Insn::AddImm(w)
             | Arm64Insn::Ldr(w)
             | Arm64Insn::Str(w)
+            | Arm64Insn::LdrLiteral(w)
             | Arm64Insn::Blr(w)
             | Arm64Insn::Br(w)
             | Arm64Insn::Other(w) => *w,

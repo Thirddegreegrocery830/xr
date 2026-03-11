@@ -174,24 +174,22 @@ pub(crate) fn scan_adrp(
             }
 
             Arm64Insn::Ldr(_) => {
-                // LDR Xn, [Xm, #imm]  — completes ADRP+LDR pairs.
+                // LDR Xt/Wt/Ht/Bt, [Xm, #imm]  — completes ADRP+LDR pairs.
                 //
-                // IDA emits for each ADRP+LDR pair:
-                //   1. data_ptr at ADRP_VA, to=got_addr  (the ADRP points to the GOT page)
-                //   2. data_read at LDR_VA, to=got_addr  (reading from the GOT slot)
-                //   3. data_ptr at LDR_VA, to=*(got_addr) (the loaded value — pointer-follow)
+                // For 64-bit loads, IDA emits:
+                //   1. data_ptr at ADRP_VA, to=addr  (the ADRP points to the page)
+                //   2. data_read at LDR_VA, to=addr  (reading from the slot)
+                //   3. data_ptr at LDR_VA, to=*(addr) (pointer-follow, 64-bit only)
                 //
-                // Register invalidation: LDR always writes its destination register with
-                // an unknown value when the memory operand can't be resolved via ADRP state.
-                // Stale ADRP state must be cleared so a subsequent BLR/BR doesn't use it
-                // to emit a wrong xref.
+                // For sub-64-bit loads (LDRW/LDRH/LDRB), IDA emits data_ptr + data_read
+                // but no pointer-follow (loaded value is not a valid 64-bit pointer).
                 //
-                // IMPORTANT: we must read adrp_state[rn] BEFORE clearing adrp_state[rt],
+                // IMPORTANT: snapshot adrp_state[rn] BEFORE clearing adrp_state[rt],
                 // because Rt == Rn is common (e.g. `ADRP X0, page; LDR X0, [X0, #off]`).
-                // Clearing Rt first would destroy the base register's ADRP state.
 
                 let rt = insn.rd() as usize;
                 let rn = insn.rn() as usize;
+                let is_64bit = insn.ldr_str_size() == 3;
 
                 // Snapshot the base register's ADRP state before any invalidation.
                 let base_state = if rn < 31 { adrp_state[rn] } else { None };
@@ -204,43 +202,39 @@ pub(crate) fn scan_adrp(
 
                 if let Some((adrp_i, adrp_va, page, _chain)) = base_state {
                     if i - adrp_i <= ADRP_WINDOW {
-                        let got_addr = page.wrapping_add(insn.ldr_str_offset());
-                        let got_is_exec = idx.is_exec(Va(got_addr));
+                        let addr = page.wrapping_add(insn.ldr_str_offset());
+                        let addr_is_exec = idx.is_exec(Va(addr));
 
-                        // ADRP → data_ptr to GOT address (matching IDA's data_ptr at ADRP)
-                        if idx.contains(Va(got_addr)) {
+                        // ADRP → data_ptr to target address (matching IDA's data_ptr at ADRP)
+                        if idx.contains(Va(addr)) {
                             xrefs.push(Xref {
                                 from: Va(adrp_va),
-                                to: Va(got_addr),
+                                to: Va(addr),
                                 kind: XrefKind::DataPointer,
                                 confidence: Confidence::PairResolved,
                             });
                         }
 
-                        if idx.contains(Va(got_addr)) {
+                        if idx.contains(Va(addr)) {
                             // data_read at LDR_va → resolved address (IDA dr_R).
-                            // IDA records this even for exec-segment targets (e.g. jump tables,
-                            // zero-init data regions embedded in .text), so no exec suppression.
                             xrefs.push(Xref {
                                 from: Va(va),
-                                to: Va(got_addr),
+                                to: Va(addr),
                                 kind: XrefKind::DataRead,
                                 confidence: Confidence::PairResolved,
                             });
                         }
 
-                        // Read the stored value at got_addr (pointer-follow) — only for
-                        // non-exec targets since exec regions don't hold valid data pointers.
-                        // Uses SegmentDataIndex for O(log n) lookup instead of a linear scan.
-                        let stored_val: Option<u64> = if !got_is_exec {
+                        // Pointer-follow: only for 64-bit loads from non-exec segments.
+                        // Sub-64-bit loads produce truncated values, not valid pointers.
+                        let stored_val: Option<u64> = if is_64bit && !addr_is_exec {
                             data_idx
-                                .read_u64_at_nonexec(Va(got_addr))
+                                .read_u64_at_nonexec(Va(addr))
                                 .filter(|&v| v != 0 && idx.contains(Va(v)))
                         } else {
                             None
                         };
 
-                        // Pointer-follow: emit data_ptr at LDR_va → loaded function/data pointer.
                         if let Some(v) = stored_val {
                             xrefs.push(Xref {
                                 from: Va(va),
@@ -250,13 +244,9 @@ pub(crate) fn scan_adrp(
                             });
                         }
 
-                        // Propagate the loaded value into ADRP state for the destination
-                        // register so chained LDRs can be resolved:
-                        //   ADRP X24, page → LDR X24, [X24, #off] → LDR X8, [X24, #0]
-                        // The second LDR uses the VALUE loaded by the first as its base.
+                        // Propagate loaded value for chained resolution (64-bit only).
                         if let Some(v) = stored_val {
                             if rt < 31 {
-                                // Internal pointer-follow: chain=true (not callable directly)
                                 adrp_state[rt] = Some((i, va, v, true));
                             }
                         }
@@ -340,7 +330,8 @@ pub(crate) fn scan_adrp(
             // We do a conservative invalidation: if the destination register
             // is in our table and this instruction isn't one we already handled,
             // clear it. ARM64 destination is bits[4:0] for most encodings.
-            Arm64Insn::Bl(_)
+            Arm64Insn::LdrLiteral(_)
+            | Arm64Insn::Bl(_)
             | Arm64Insn::B(_)
             | Arm64Insn::BCond(_)
             | Arm64Insn::Cbz(_)
@@ -428,6 +419,21 @@ fn immediate_xref(insn: Arm64Insn, va: u64, idx: &SegmentIndex) -> Option<Xref> 
                     from: Va(va),
                     to: Va(target),
                     kind: XrefKind::CondJump,
+                    confidence: Confidence::LinearImmediate,
+                })
+            } else {
+                None
+            }
+        }
+        Arm64Insn::LdrLiteral(_) => {
+            // LDR Xt/Wt, label — PC-relative literal load.
+            // IDA records data_read at this VA to the literal pool address.
+            let target = insn.ldr_literal_target(va);
+            if idx.contains(Va(target)) {
+                Some(Xref {
+                    from: Va(va),
+                    to: Va(target),
+                    kind: XrefKind::DataRead,
                     confidence: Confidence::LinearImmediate,
                 })
             } else {
