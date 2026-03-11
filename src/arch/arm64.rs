@@ -530,8 +530,8 @@ impl JumpTableAddInfo {
                 sign_extend,
             });
         }
-        // No shift, no sign-extend (e.g. plain ADD immediate — unlikely but safe).
-        Some(Self { shift: 0, sign_extend: false })
+        // Not a recognised ADD form (shifted or extended register).
+        None
     }
 
     /// Read one table entry and apply sign-extension according to this info.
@@ -547,16 +547,21 @@ impl JumpTableAddInfo {
 
 /// Results of the backward scan from a BR instruction.
 ///
-/// All four fields must be present for jump table recovery to proceed.
+/// All non-Option fields must be present for jump table recovery to proceed.
 struct JumpTablePattern {
     /// ADR target — the base address to which table offsets are added.
     target_base: Va,
-    /// Start of the table data (from ADRP+ADD resolved via `adrp_state`).
+    /// Start of the table data (from ADRP+ADD resolved in the backward scan).
     table_base: Va,
     /// Width of each table entry (byte or halfword).
     entry_size: JumpTableEntrySize,
     /// Register used as the switch index (from the LDR Rm field).
     index_reg: Reg,
+    /// Shift / sign-extension from the ADD that combines offset with target base.
+    add_info: JumpTableAddInfo,
+    /// CMP bound found in the backward scan (may be None if CMP is too far away;
+    /// caller falls back to forward-scan `ScanState::get_cmp`).
+    cmp_bound: Option<CmpBound>,
 }
 
 /// Shared immutable context passed through the jump-table recovery helpers.
@@ -600,31 +605,13 @@ fn recover_arm64_jump_table(
         return;
     };
 
-    // Table size from CMP bound.  Without a bound we bail to avoid FP explosion.
-    let Some(bound) = ctx.state.get_cmp(pattern.index_reg) else {
+    // Table size from CMP bound.  Prefer the backward-scan CMP (survives
+    // register overwrites between CMP and BR) over forward-scan state.
+    let Some(bound) = pattern.cmp_bound.or_else(|| ctx.state.get_cmp(pattern.index_reg)) else {
         return;
     };
     let limit = bound.table_limit();
-
-    // Extract shift / sign-extension from the ADD at BR-1.
-    let n_insns = ctx.data.len() / 4;
-    let add_info = (|| {
-        let add_idx = br_index.checked_sub(1)?;
-        if add_idx >= n_insns { return None; }
-        let add_off = add_idx * 4;
-        let aw = u32::from_le_bytes(
-            ctx.data[add_off..add_off + 4]
-                .try_into()
-                .expect("guarded by add_idx < n_insns"),
-        );
-        JumpTableAddInfo::decode(aw)
-    })()
-    .unwrap_or(JumpTableAddInfo { shift: 0, sign_extend: false });
-
-    // Reject implausible shifts — real tables use 0 or 2.
-    if add_info.shift > MAX_JUMP_TABLE_SHIFT {
-        return;
-    }
+    let add_info = pattern.add_info;
 
     for k in 0..limit {
         let slot_va = pattern.table_base + (k as u64) * pattern.entry_size.bytes();
@@ -653,18 +640,35 @@ fn recover_arm64_jump_table(
     }
 }
 
-/// Scan up to 8 instructions before `br_index` looking for the ADR + LDRB/LDRH
-/// pattern that forms a jump table.
+/// Scan backward from `br_index` looking for the jump-table pattern.
+///
+/// Resolves the table base address directly from ADRP+ADD instructions in the
+/// backward window rather than relying on forward-scan `ScanState`, which may
+/// have been overwritten by later instructions (e.g. an ADR that reuses the
+/// table base register).  CMP bounds are also extracted here as a fallback
+/// when the forward scan clears `cmp_bound` due to register reuse in the LDRH.
+///
+/// Lookback is 12 instructions: the core pattern (ADR+LDRB/H+ADD+BR) is 4
+/// instructions, but the ADRP+ADD that set the table base and the CMP that
+/// set the bound can be several instructions earlier.
 fn scan_backward_for_pattern(
     br_index: usize,
     ctx: &JumpTableCtx,
 ) -> Option<JumpTablePattern> {
-    let lookback = br_index.min(8);
+    let lookback = br_index.min(12);
 
     let mut target_base: Option<Va> = None;
-    let mut table_base: Option<Va> = None;
+    // ADD (shifted/extended register) that combines the loaded offset with target_base.
+    let mut add_info: Option<JumpTableAddInfo> = None;
+    // LDRB/LDRH results: table register, entry size, index register.
+    let mut table_reg: Option<Reg> = None;
     let mut entry_size: Option<JumpTableEntrySize> = None;
     let mut index_reg: Option<Reg> = None;
+    // ADRP+ADD resolution for the table register (self-contained).
+    let mut adrp_page: Option<(Reg, u64)> = None; // (rd, page)
+    let mut add_imm_val: Option<(Reg, u64)> = None; // (rd, imm) from ADD Xd, Xd, #imm
+    // CMP bound found in the backward scan.
+    let mut cmp_bound: Option<(Reg, CmpBound)> = None;
 
     for back in 1..=lookback {
         let j = br_index - back;
@@ -679,7 +683,14 @@ fn scan_backward_for_pattern(
         );
         let insn_va = ctx.base + offset as u64;
 
-        // ADR Xd, label
+        // ADD (shifted or extended register) — offset-to-target computation.
+        // Accept the first (closest to BR) match; there may be intervening
+        // instructions (e.g. MOV) between this ADD and the BR.
+        if add_info.is_none() {
+            add_info = JumpTableAddInfo::decode(w);
+        }
+
+        // ADR Xd, label — target base for the jump table
         if (w & 0x9F00_0000) == 0x1000_0000 {
             let immlo = (w >> 29) & 3;
             let immhi = (w >> 5) & 0x7_FFFF;
@@ -701,11 +712,9 @@ fn scan_backward_for_pattern(
             let rn = Reg::new(((w >> 5) & 0x1F) as u8);
             let rm = Reg::new(((w >> 16) & 0x1F) as u8);
             if let (Some(rn), Some(rm)) = (rn, rm) {
-                if let Some(st) = ctx.state.get_adrp(rn) {
-                    table_base = Some(st.value);
-                    entry_size = Some(JumpTableEntrySize::Byte);
-                    index_reg = Some(rm);
-                }
+                table_reg = Some(rn);
+                entry_size = Some(JumpTableEntrySize::Byte);
+                index_reg = Some(rm);
             }
         }
 
@@ -714,21 +723,112 @@ fn scan_backward_for_pattern(
             let rn = Reg::new(((w >> 5) & 0x1F) as u8);
             let rm = Reg::new(((w >> 16) & 0x1F) as u8);
             if let (Some(rn), Some(rm)) = (rn, rm) {
-                if let Some(st) = ctx.state.get_adrp(rn) {
-                    table_base = Some(st.value);
-                    entry_size = Some(JumpTableEntrySize::Halfword);
-                    index_reg = Some(rm);
+                table_reg = Some(rn);
+                entry_size = Some(JumpTableEntrySize::Halfword);
+                index_reg = Some(rm);
+            }
+        }
+
+        // ADRP Xd, page — potential table page.
+        // First-wins: keep the one closest to the BR.
+        if adrp_page.is_none() && (w & 0x9F00_0000) == 0x9000_0000 {
+            if let Some(rd) = Reg::new((w & 0x1F) as u8) {
+                let immlo = (w >> 29) & 3;
+                let immhi = (w >> 5) & 0x7_FFFF;
+                let imm21 = (immhi << 2) | immlo;
+                let sext = (imm21 as i32) << 11 >> 11;
+                let page_pc = insn_va.raw() & !0xFFF;
+                let page = page_pc.wrapping_add((sext as i64 * 4096) as u64);
+                adrp_page = Some((rd, page));
+            }
+        }
+
+        // ADD Xd, Xn, #imm (immediate) — potential table offset.
+        // Encoding: sf|0|0|100010|sh|imm12|Rn|Rd
+        // bits[30:29]=00 distinguishes ADD from SUB (bit30=1) and ADDS (bit29=1).
+        // Mask 0x7F00_0000 covers bits[30:24]; match 0x1100_0000 for ADD imm.
+        if (w & 0x7F00_0000) == 0x1100_0000 {
+            let rd_raw = (w & 0x1F) as u8;
+            let rn_raw = ((w >> 5) & 0x1F) as u8;
+            // Only accept ADD Xd, Xd, #imm (same register, common in ADRP+ADD).
+            // First-wins: keep the one closest to the BR.
+            if rd_raw == rn_raw && add_imm_val.is_none() {
+                if let Some(rd) = Reg::new(rd_raw) {
+                    let imm12 = ((w >> 10) & 0xFFF) as u64;
+                    let shift = (w >> 22) & 3;
+                    let imm = if shift == 1 { imm12 << 12 } else { imm12 };
+                    add_imm_val = Some((rd, imm));
+                }
+            }
+        }
+
+        // CMP Wn, #imm (= SUBS WZR, Wn, #imm) — switch bound
+        // Mask 0x7F80_0000 covers bits[30:23]; match 0x7100_0000 for
+        // op=1(SUB), S=1, shift=00.  Accepts both sf=0 (W) and sf=1 (X).
+        if (w & 0x1F) == 31 && (w & 0x7F80_0000) == 0x7100_0000 {
+            let rn_raw = ((w >> 5) & 0x1F) as u8;
+            let imm12 = (w >> 10) & 0xFFF;
+            let shift = (w >> 22) & 1;
+            if shift == 0 {
+                if let Some(rn) = Reg::new(rn_raw) {
+                    // Keep the CMP closest to the BR (first found going backward).
+                    if cmp_bound.is_none() {
+                        cmp_bound = Some((rn, CmpBound(imm12 + 1)));
+                    }
                 }
             }
         }
     }
 
+    // Resolve the table base from ADRP+ADD found in the backward scan.
+    let tbl_reg = table_reg?;
+    let table_base = resolve_table_base(tbl_reg, adrp_page, add_imm_val, ctx);
+
+    // CMP bound: use backward-scan result if it matches the index register.
+    let idx_reg = index_reg?;
+    let local_cmp = cmp_bound.and_then(|(r, b)| if r == idx_reg { Some(b) } else { None });
+
+    // Default to no shift / no sign-extend if no ADD was found.
+    let add = add_info.unwrap_or(JumpTableAddInfo { shift: 0, sign_extend: false });
+
     Some(JumpTablePattern {
         target_base: target_base?,
         table_base: table_base?,
         entry_size: entry_size?,
-        index_reg: index_reg?,
+        index_reg: idx_reg,
+        add_info: add,
+        cmp_bound: local_cmp,
     })
+}
+
+/// Resolve the table base address from the backward-scan ADRP+ADD results,
+/// falling back to forward-scan `ScanState` if the backward scan didn't find
+/// a matching ADRP (e.g. ADRP was more than 12 instructions before the BR).
+fn resolve_table_base(
+    tbl_reg: Reg,
+    adrp_page: Option<(Reg, u64)>,
+    add_imm_val: Option<(Reg, u64)>,
+    ctx: &JumpTableCtx,
+) -> Option<Va> {
+    // Best case: both ADRP and ADD found in the backward scan for tbl_reg.
+    if let (Some((adrp_rd, page)), Some((add_rd, imm))) = (adrp_page, add_imm_val) {
+        if adrp_rd == tbl_reg && add_rd == tbl_reg {
+            return Some(Va::new(page + imm));
+        }
+    }
+    // ADRP only (no ADD offset, or ADD was for a different register).
+    if let Some((adrp_rd, page)) = adrp_page {
+        if adrp_rd == tbl_reg {
+            if let Some((add_rd, imm)) = add_imm_val {
+                if add_rd == tbl_reg {
+                    return Some(Va::new(page + imm));
+                }
+            }
+            return Some(Va::new(page));
+        }
+    }
+    // Fallback: forward-scan state (works when ADRP+ADD wasn't overwritten).
+    ctx.state.get_adrp(tbl_reg).map(|st| st.value)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
