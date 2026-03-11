@@ -708,7 +708,9 @@ fn scan_backward_for_pattern(
         }
 
         // LDRB (register): 0011_1000_011m_mmmm_xxxx_xxnn_nnnt_tttt
-        if (w & 0xFFE0_0C00) == 0x3860_0800 {
+        // First-wins: in cascaded switches the backward window may span
+        // two switch patterns; keep the load closest to the BR.
+        if table_reg.is_none() && (w & 0xFFE0_0C00) == 0x3860_0800 {
             let rn = Reg::new(((w >> 5) & 0x1F) as u8);
             let rm = Reg::new(((w >> 16) & 0x1F) as u8);
             if let (Some(rn), Some(rm)) = (rn, rm) {
@@ -719,7 +721,7 @@ fn scan_backward_for_pattern(
         }
 
         // LDRH (register): 0111_1000_011m_mmmm_xxxx_xxnn_nnnt_tttt
-        if (w & 0xFFE0_0C00) == 0x7860_0800 {
+        if table_reg.is_none() && (w & 0xFFE0_0C00) == 0x7860_0800 {
             let rn = Reg::new(((w >> 5) & 0x1F) as u8);
             let rm = Reg::new(((w >> 16) & 0x1F) as u8);
             if let (Some(rn), Some(rm)) = (rn, rm) {
