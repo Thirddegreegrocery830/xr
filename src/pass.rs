@@ -436,7 +436,7 @@ fn scan_shard(
     match (arch, seg.mode, depth) {
         // ARM64 — always Default mode at this point (Thumb handled separately)
         (Arch::Arm64, DecodeMode::Default, Depth::Linear) => {
-            arm64::scan_linear(&region, ctx.seg_idx, ctx.data_idx)
+            arm64::scan_linear(&region, ctx.seg_idx)
         }
         (Arch::Arm64, DecodeMode::Default, Depth::Paired) => {
             arm64::scan_adrp(&region, ctx.seg_idx, ctx.data_idx)

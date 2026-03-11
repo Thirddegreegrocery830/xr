@@ -29,7 +29,6 @@ const ADRP_WINDOW: usize = 8;
 pub(crate) fn scan_linear(
     region: &ScanRegion,
     idx: &SegmentIndex,
-    _data_idx: &SegmentDataIndex,
 ) -> XrefSet {
     let mut xrefs = Vec::new();
     let data = region.data;
@@ -497,8 +496,7 @@ mod tests {
 
         let region = region_for(&code_seg);
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region, &idx, &didx);
+        let xrefs = scan_linear(&region, &idx);
 
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].from, Va(0x1000));
@@ -520,8 +518,7 @@ mod tests {
         let segs = vec![fake_seg(0x1008, &CODE), tgt_seg];
 
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code_seg), &idx, &didx);
+        let xrefs = scan_linear(&region_for(&code_seg), &idx);
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].from, Va(0x1008));
         assert_eq!(xrefs[0].to, Va(0x1010));
@@ -542,8 +539,7 @@ mod tests {
         let segs = vec![fake_seg(0x1004, &CODE)];
 
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&seg), &idx, &didx);
+        let xrefs = scan_linear(&region_for(&seg), &idx);
         // CBZ at 0x1008 → target 0x1004
         let cbz_xref = xrefs.iter().find(|x| x.from == Va(0x1008)).unwrap();
         assert_eq!(cbz_xref.to, Va(0x1004));
@@ -641,8 +637,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE)];
 
         let idx = SegmentIndex::build(&segs);
-        let didx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code_seg), &idx, &didx);
+        let xrefs = scan_linear(&region_for(&code_seg), &idx);
         assert!(
             xrefs.is_empty(),
             "xref to unmapped target should be suppressed"
