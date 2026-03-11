@@ -1065,7 +1065,8 @@ fn parse_pe(
         }
     }
 
-    let reloc_pointers = build_pe_reloc_pointers(bytes, pe, image_base, &segments);
+    let mut reloc_pointers = build_pe_reloc_pointers(bytes, pe, image_base, &segments);
+    build_pe_pdata_xrefs(bytes, pe, image_base, &segments, &mut reloc_pointers);
     let got_slots = build_pe_iat_slots(pe, image_base);
 
     Ok(ParseResult {
@@ -1077,6 +1078,73 @@ fn parse_pe(
         got_slots,
         reloc_pointers,
     })
+}
+
+/// Extract data-pointer xrefs from the PE exception directory (`.pdata`).
+///
+/// Each `RUNTIME_FUNCTION` is 12 bytes: `{ BeginAddress: u32, EndAddress: u32,
+/// UnwindInfoAddress: u32 }` — all image-relative RVAs.  IDA emits four
+/// `data_ptr` xrefs per entry, all attributed to the entry's start address:
+///
+///   (entry_va, image_base)                         — base reference
+///   (entry_va, image_base + BeginAddress)           — function start
+///   (entry_va, image_base + EndAddress)             — function end
+///   (entry_va, image_base + UnwindInfoAddress)      — unwind data
+fn build_pe_pdata_xrefs(
+    bytes: &[u8],
+    pe: &goblin::pe::PE,
+    image_base: u64,
+    segments: &[Segment],
+    out: &mut Vec<RelocPointer>,
+) {
+    let oh = match pe.header.optional_header.as_ref() {
+        Some(oh) => oh,
+        None => return,
+    };
+    let dd = match oh.data_directories.get_exception_table() {
+        Some(dd) => dd,
+        None => return,
+    };
+
+    let sec_map = PeSectionMap::build(pe);
+    let seg_set = VaRangeSet::build(segments);
+
+    let dir_rva = dd.virtual_address;
+    let dir_size = dd.size;
+    let count = dir_size / 12;
+    let base_va = Va::new(image_base);
+
+    for i in 0..count {
+        let entry_rva = dir_rva + i * 12;
+        let file_off = match sec_map.rva_to_file_offset(entry_rva) {
+            Some(off) => off,
+            None => continue,
+        };
+        if file_off + 12 > bytes.len() {
+            break;
+        }
+
+        let begin_rva = u32::from_le_bytes(bytes[file_off..file_off + 4].try_into().unwrap());
+        let end_rva = u32::from_le_bytes(bytes[file_off + 4..file_off + 8].try_into().unwrap());
+        let unwind_rva =
+            u32::from_le_bytes(bytes[file_off + 8..file_off + 12].try_into().unwrap());
+
+        let from = Va::new(image_base + entry_rva as u64);
+
+        // IDA emits a reference to image_base itself for every entry.
+        if seg_set.contains(base_va) {
+            out.push(RelocPointer { from, to: base_va });
+        }
+
+        for rva in [begin_rva, end_rva, unwind_rva & !1u32] {
+            if rva != 0 {
+                let target = Va::new(image_base + rva as u64);
+                if seg_set.contains(target) {
+                    out.push(RelocPointer { from, to: target });
+                }
+            }
+        }
+    }
 }
 
 /// Build the set of IAT (Import Address Table) slot VAs for a PE binary.
