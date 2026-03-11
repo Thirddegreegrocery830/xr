@@ -345,15 +345,19 @@ impl<'a> XrefPass<'a> {
 
                 // Relocation-derived data pointers — emit as a single batch.
                 // These come from ELF .rela.dyn / .rel.dyn (R_*_RELATIVE, R_*_64)
-                // and are nearly 100% precise (reloc entries are authoritative).
+                // and PE .pdata (exception directory) entries.
+                //
+                // These are authoritative metadata, so they bypass min_ref_va
+                // (which exists to suppress byte-scan noise in low VA ranges).
+                // PE .pdata entries reference image_base which is below the
+                // first section — min_ref_va would wrongly filter those out.
                 if !self.binary.reloc_pointers.is_empty() {
                     let batch: Vec<Xref> = self
                         .binary
                         .reloc_pointers
                         .iter()
                         .filter(|rp| {
-                            min_ref_va.is_none_or(|m| rp.to >= m)
-                                && from_range.is_none_or(|r| r.contains(rp.from))
+                            from_range.is_none_or(|r| r.contains(rp.from))
                                 && to_range.is_none_or(|r| r.contains(rp.to))
                         })
                         .map(|rp| Xref {

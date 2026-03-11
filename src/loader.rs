@@ -1132,9 +1132,10 @@ fn build_pe_pdata_xrefs(
         let from = Va::new(image_base + entry_rva as u64);
 
         // IDA emits a reference to image_base itself for every entry.
-        if seg_set.contains(base_va) {
-            out.push(RelocPointer { from, to: base_va });
-        }
+        // image_base typically points at the PE header (before the first
+        // section), so it won't be inside any loaded segment — emit it
+        // unconditionally.
+        out.push(RelocPointer { from, to: base_va });
 
         for rva in [begin_rva, end_rva, unwind_rva & !1u32] {
             if rva != 0 {
@@ -1144,6 +1145,90 @@ fn build_pe_pdata_xrefs(
                 }
             }
         }
+    }
+
+    // ── UNWIND_INFO exception handler RVAs ────────────────────────────────
+    //
+    // When UNWIND_INFO has UNW_FLAG_EHANDLER or UNW_FLAG_UHANDLER, the
+    // ExceptionHandler RVA follows immediately after the unwind codes.
+    // This is a high-confidence reference (the handler must be a real
+    // function in .text).
+    build_pe_unwind_handler_xrefs(bytes, image_base, dir_rva, dir_size, &sec_map, &seg_set, out);
+}
+
+/// Parse `UNWIND_INFO` structures referenced by `.pdata` entries and extract
+/// the `ExceptionHandler` RVA from each.
+fn build_pe_unwind_handler_xrefs(
+    bytes: &[u8],
+    image_base: u64,
+    pdata_rva: u32,
+    pdata_size: u32,
+    sec_map: &PeSectionMap,
+    seg_set: &VaRangeSet,
+    out: &mut Vec<RelocPointer>,
+) {
+    const UNW_FLAG_EHANDLER: u8 = 0x01;
+    const UNW_FLAG_UHANDLER: u8 = 0x02;
+
+    let count = pdata_size / 12;
+    let mut seen_unwind: rustc_hash::FxHashSet<u32> = Default::default();
+
+    for i in 0..count {
+        let entry_off = match sec_map.rva_to_file_offset(pdata_rva + i * 12) {
+            Some(off) => off,
+            None => continue,
+        };
+        if entry_off + 12 > bytes.len() {
+            break;
+        }
+        let unwind_rva =
+            u32::from_le_bytes(bytes[entry_off + 8..entry_off + 12].try_into().unwrap()) & !1u32;
+        if unwind_rva == 0 || !seen_unwind.insert(unwind_rva) {
+            continue;
+        }
+
+        let ui_off = match sec_map.rva_to_file_offset(unwind_rva) {
+            Some(off) => off,
+            None => continue,
+        };
+        if ui_off + 4 > bytes.len() {
+            continue;
+        }
+
+        let flags = bytes[ui_off] >> 3;
+        if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) == 0 {
+            continue;
+        }
+
+        let count_of_codes = bytes[ui_off + 2] as usize;
+        // Unwind codes are 2 bytes each, starting at offset 4.
+        // After codes, pad to 4-byte alignment, then ExceptionHandler (u32).
+        let mut handler_file_off = ui_off + 4 + count_of_codes * 2;
+        if !handler_file_off.is_multiple_of(4) {
+            handler_file_off += 4 - (handler_file_off % 4);
+        }
+        if handler_file_off + 4 > bytes.len() {
+            continue;
+        }
+
+        let handler_rva = u32::from_le_bytes(
+            bytes[handler_file_off..handler_file_off + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if handler_rva == 0 {
+            continue;
+        }
+        let target = Va::new(image_base + handler_rva as u64);
+        if !seg_set.contains(target) {
+            continue;
+        }
+
+        // The from-address is the file position of the handler RVA field,
+        // mapped back to its VA.
+        let handler_field_rva = unwind_rva + (handler_file_off - ui_off) as u32;
+        let from = Va::new(image_base + handler_field_rva as u64);
+        out.push(RelocPointer { from, to: target });
     }
 }
 
