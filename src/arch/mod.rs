@@ -45,55 +45,80 @@ impl<'a> ScanRegion<'a> {
 /// May contain duplicates (from shard overlap) — caller deduplicates.
 pub(crate) type XrefSet = Vec<Xref>;
 
+// ── Segment flags ─────────────────────────────────────────────────────────────
+
+/// Per-segment attribute bitmask stored in [`SegmentIndex`] and
+/// [`SegmentDataIndex`] entries.
+///
+/// Newtype over `u8` so the flags cannot be accidentally mixed with other
+/// byte values.  Use the provided `contains` / constant methods instead of
+/// raw bit-twiddling at call sites.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub(crate) struct SegFlags(u8);
+
+impl SegFlags {
+    pub(crate) const EMPTY: Self = Self(0);
+    pub(crate) const EXEC: Self = Self(0b01);
+    pub(crate) const WRITE: Self = Self(0b10);
+
+    /// Merge two flag sets (bitwise OR).
+    #[inline]
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// True if `self` contains all bits in `other`.
+    #[inline]
+    pub(crate) const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// Compute the attribute flags for a segment.
+#[inline]
+fn segment_flags(s: &Segment) -> SegFlags {
+    let mut flags = SegFlags::EMPTY;
+    if s.executable {
+        flags = flags.union(SegFlags::EXEC);
+    }
+    if s.writable {
+        flags = flags.union(SegFlags::WRITE);
+    }
+    flags
+}
+
 // ── Segment index ─────────────────────────────────────────────────────────────
 
 /// Sorted, copy-friendly VA interval table for O(log n) membership and
 /// attribute queries. Built once per pass from `LoadedBinary::segments`.
 ///
-/// Each entry is `(start, end, flags)` where `flags` stores the segment
-/// attributes as a bitmask:
-///   bit 0 — executable
-///   bit 1 — writable
+/// Each entry is `(start, end, flags)` where [`SegFlags`] stores the segment
+/// attributes as a bitmask.
 pub(crate) struct SegmentIndex {
     /// Sorted by `start`.
-    entries: Vec<(Va, Va, u8)>,
-}
-
-pub(crate) const FLAG_EXEC: u8 = 0b01;
-pub(crate) const FLAG_WRITE: u8 = 0b10;
-
-/// Compute the attribute bitmask for a segment.
-#[inline]
-fn segment_flags(s: &Segment) -> u8 {
-    let mut flags = 0u8;
-    if s.executable {
-        flags |= FLAG_EXEC;
-    }
-    if s.writable {
-        flags |= FLAG_WRITE;
-    }
-    flags
+    entries: Vec<(Va, Va, SegFlags)>,
 }
 
 /// Warn (once per build) if sorted intervals overlap — binary search may give
 /// wrong results on malformed binaries.
-fn check_disjoint(label: &str, entries: &[(Va, Va)]) {
-    if !entries.windows(2).all(|w| w[0].1 <= w[1].0) {
+fn check_disjoint<T, F: Fn(&T) -> (Va, Va)>(label: &str, entries: &[T], extract: F) {
+    let overlaps = entries
+        .windows(2)
+        .any(|w| extract(&w[0]).1 > extract(&w[1]).0);
+    if overlaps {
         eprintln!("warning: {label}: overlapping segments detected (binary search may give wrong results)");
     }
 }
 
 impl SegmentIndex {
     pub(crate) fn build(segments: &[Segment]) -> Self {
-        let mut entries: Vec<(Va, Va, u8)> = segments
+        let mut entries: Vec<(Va, Va, SegFlags)> = segments
             .iter()
             .map(|s| (s.va, s.va + s.data.len() as u64, segment_flags(s)))
             .collect();
         entries.sort_unstable_by_key(|e| e.0);
-        check_disjoint(
-            "SegmentIndex",
-            &entries.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(),
-        );
+        check_disjoint("SegmentIndex", &entries, |e| (e.0, e.1));
         Self { entries }
     }
 
@@ -106,18 +131,18 @@ impl SegmentIndex {
     /// True if `va` falls within an executable segment.
     #[inline]
     pub(crate) fn is_exec(&self, va: Va) -> bool {
-        self.entry_at(va).is_some_and(|f| f & FLAG_EXEC != 0)
+        self.entry_at(va).is_some_and(|f| f.contains(SegFlags::EXEC))
     }
 
-    /// Returns the flags byte for the segment covering `va`, or None if unmapped.
+    /// Returns the flags for the segment covering `va`, or None if unmapped.
     #[inline]
-    pub(crate) fn flags_at(&self, va: Va) -> Option<u8> {
+    pub(crate) fn flags_at(&self, va: Va) -> Option<SegFlags> {
         self.entry_at(va)
     }
 
-    /// Binary-search for the entry covering `va`. Returns the flags byte.
+    /// Binary-search for the entry covering `va`. Returns the flags.
     #[inline]
-    fn entry_at(&self, va: Va) -> Option<u8> {
+    fn entry_at(&self, va: Va) -> Option<SegFlags> {
         let idx = self.entries.partition_point(|e| e.0 <= va);
         if idx == 0 {
             return None;
@@ -137,7 +162,7 @@ impl SegmentIndex {
 struct DataIndexEntry<'a> {
     start: Va,
     end: Va,
-    flags: u8,
+    flags: SegFlags,
     data: &'a [u8],
 }
 
@@ -166,10 +191,7 @@ impl<'a> SegmentDataIndex<'a> {
             })
             .collect();
         entries.sort_unstable_by_key(|e| e.start);
-        check_disjoint(
-            "SegmentDataIndex",
-            &entries.iter().map(|e| (e.start, e.end)).collect::<Vec<_>>(),
-        );
+        check_disjoint("SegmentDataIndex", &entries, |e| (e.start, e.end));
         Self { entries }
     }
 
@@ -194,7 +216,7 @@ impl<'a> SegmentDataIndex<'a> {
     #[inline]
     pub(crate) fn read_u64_at_nonexec(&self, va: Va) -> Option<u64> {
         let e = self.entry_at(va)?;
-        if e.flags & FLAG_EXEC != 0 {
+        if e.flags.contains(SegFlags::EXEC) {
             return None;
         }
         let offset = (va - e.start) as usize;
@@ -204,9 +226,9 @@ impl<'a> SegmentDataIndex<'a> {
         ))
     }
 
-    /// Returns the flags byte for the segment covering `va`, or `None` if unmapped.
+    /// Returns the flags for the segment covering `va`, or `None` if unmapped.
     #[inline]
-    pub(crate) fn flags_at(&self, va: Va) -> Option<u8> {
+    pub(crate) fn flags_at(&self, va: Va) -> Option<SegFlags> {
         self.entry_at(va).map(|e| e.flags)
     }
 
@@ -266,7 +288,7 @@ pub(crate) fn byte_scan_pointers(
             let target_va = Va::new(target);
             let emit = match data_idx.flags_at(target_va) {
                 // Target in a non-exec segment: always emit.
-                Some(f) if f & FLAG_EXEC == 0 => true,
+                Some(f) if !f.contains(SegFlags::EXEC) => true,
                 // Target in an exec segment: vtables and function pointer tables
                 // legitimately hold code pointers, so allow them — but require at
                 // least 4 significant bytes to reject ASCII-string false positives.

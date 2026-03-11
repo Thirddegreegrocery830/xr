@@ -20,6 +20,15 @@ pub struct DisasmLine {
     pub is_focus: bool,
 }
 
+/// Decoded instruction data before focus/context tagging.
+/// Used internally to accumulate instructions before building the final
+/// `DisasmLine` list.
+struct DecodedInsn {
+    va: u64,
+    bytes: Vec<u8>,
+    text: String,
+}
+
 /// Disassemble a window of instructions around `focus_va`.
 ///
 /// Returns up to `before + 1 + after` lines centred on the instruction at
@@ -87,7 +96,7 @@ fn disasm_x86(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<
     let mut anchor_dec = Decoder::with_ip(bitness, anchor_data, focus_va, DecoderOptions::NONE);
     let mut anchor_fmt = make_fmt();
 
-    let mut anchor_insns: Vec<(u64, Vec<u8>, String)> = Vec::new();
+    let mut anchor_insns: Vec<DecodedInsn> = Vec::new();
     while anchor_dec.can_decode() {
         let ip = anchor_dec.ip();
         if anchor_insns.len() > after + 1 {
@@ -99,11 +108,11 @@ fn disasm_x86(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<
         let raw = anchor_data[off..off + len].to_vec();
         let mut buf = Buf(String::new());
         anchor_fmt.format(&insn, &mut buf);
-        anchor_insns.push((ip, raw, buf.0));
+        anchor_insns.push(DecodedInsn { va: ip, bytes: raw, text: buf.0 });
     }
 
     // Focus must be the first anchor instruction.
-    if anchor_insns.is_empty() || anchor_insns[0].0 != focus_va {
+    if anchor_insns.is_empty() || anchor_insns[0].va != focus_va {
         return vec![];
     }
 
@@ -129,7 +138,7 @@ fn disasm_x86(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<
 
     const MAX_X86_INSN: usize = 15;
 
-    let mut before_context: Vec<(u64, Vec<u8>, String)> = Vec::with_capacity(before);
+    let mut before_context: Vec<DecodedInsn> = Vec::with_capacity(before);
     let mut cursor_off = seg_offset; // current "right edge" we're scanning back from
 
     for _ in 0..before {
@@ -173,7 +182,7 @@ fn disasm_x86(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<
                 let raw = slice[..insn.len()].to_vec();
                 let mut buf = Buf(String::new());
                 fmt.format(&insn, &mut buf);
-                before_context.push((probe_va.raw(), raw, buf.0));
+                before_context.push(DecodedInsn { va: probe_va.raw(), bytes: raw, text: buf.0 });
                 cursor_off = probe_off;
             }
         }
@@ -188,25 +197,25 @@ fn disasm_x86(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Vec<
 
     let mut result: Vec<DisasmLine> =
         Vec::with_capacity(before_context.len() + 1 + after_lines.len());
-    for (va, bytes, text) in &before_context {
+    for d in &before_context {
         result.push(DisasmLine {
-            va: *va,
-            bytes: bytes.clone(),
-            text: text.clone(),
+            va: d.va,
+            bytes: d.bytes.clone(),
+            text: d.text.clone(),
             is_focus: false,
         });
     }
     result.push(DisasmLine {
-        va: focus_line.0,
-        bytes: focus_line.1.clone(),
-        text: focus_line.2.clone(),
+        va: focus_line.va,
+        bytes: focus_line.bytes.clone(),
+        text: focus_line.text.clone(),
         is_focus: true,
     });
-    for (va, bytes, text) in after_lines {
+    for d in after_lines {
         result.push(DisasmLine {
-            va: *va,
-            bytes: bytes.clone(),
-            text: text.clone(),
+            va: d.va,
+            bytes: d.bytes.clone(),
+            text: d.text.clone(),
             is_focus: false,
         });
     }
@@ -228,15 +237,15 @@ fn disasm_arm64(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Ve
     let scan_end_off = (scan_start_off + total * 4).min(seg.data.len());
     let data = &seg.data[scan_start_off..scan_end_off];
 
-    let mut all: Vec<(u64, Vec<u8>, String)> = Vec::new();
+    let mut all: Vec<DecodedInsn> = Vec::new();
     for (i, chunk) in data.chunks_exact(4).enumerate() {
         let va = (scan_start_va + (i * 4) as u64).raw();
-        let word = u32::from_le_bytes(chunk.try_into().unwrap());
+        let word = u32::from_le_bytes(chunk.try_into().expect("chunks_exact(4)"));
         let text = match bad64::decode(word, va) {
             Ok(insn) => insn.to_string(),
             Err(_) => format!(".word 0x{word:08x}"),
         };
-        all.push((va, chunk.to_vec(), text));
+        all.push(DecodedInsn { va, bytes: chunk.to_vec(), text });
     }
 
     build_window(all, focus_va, before, after)
@@ -245,12 +254,12 @@ fn disasm_arm64(seg: &Segment, focus_va: u64, before: usize, after: usize) -> Ve
 // ── Shared window builder ─────────────────────────────────────────────────────
 
 fn build_window(
-    all: Vec<(u64, Vec<u8>, String)>,
+    all: Vec<DecodedInsn>,
     focus_va: u64,
     before: usize,
     after: usize,
 ) -> Vec<DisasmLine> {
-    let focus_idx = match all.iter().position(|(va, _, _)| *va == focus_va) {
+    let focus_idx = match all.iter().position(|d| d.va == focus_va) {
         Some(i) => i,
         // focus_va not cleanly decoded (e.g. mid-instruction on x86) — no output.
         None => return vec![],
@@ -261,11 +270,11 @@ fn build_window(
 
     all[start..end]
         .iter()
-        .map(|(va, bytes, text)| DisasmLine {
-            va: *va,
-            bytes: bytes.clone(),
-            text: text.clone(),
-            is_focus: *va == focus_va,
+        .map(|d| DisasmLine {
+            va: d.va,
+            bytes: d.bytes.clone(),
+            text: d.text.clone(),
+            is_focus: d.va == focus_va,
         })
         .collect()
 }

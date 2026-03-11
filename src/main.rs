@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use xr::output::{ContextLine, CsvPrinter, JsonlPrinter, Printer, TextPrinter, XrefRecord};
 use xr::va::VaRange;
 use xr::xref::XrefKind;
-use xr::{parse_va, Depth, LoadedBinary, PassConfig, Va, XrefPass};
+use xr::{Depth, LoadedBinary, PassConfig, Va, XrefPass};
 
 /// Capacity for the stdout BufWriter (4 MiB).
 ///
@@ -28,12 +28,12 @@ struct Cli {
     /// 0x400000. Use this to match a specific runtime load address or to
     /// reproduce IDA's layout for a different base.
     /// Ignored for non-PIE ELF, Mach-O, and PE.
-    #[arg(long, value_parser = parse_va)]
-    base: Option<u64>,
+    #[arg(long, value_parser = Va::parse)]
+    base: Option<Va>,
 
     /// Analysis depth
     #[arg(short, long, default_value = "paired")]
-    depth: DepthArg,
+    depth: Depth,
 
     /// Number of worker threads (0 = all CPUs)
     #[arg(short = 'j', long, default_value = "0")]
@@ -46,8 +46,8 @@ struct Cli {
     /// Minimum target VA for emitted xrefs. Xrefs whose 'to' is below this
     /// are silently dropped. Default: auto-detect from binary (binary.min_va()).
     /// Set to 0 to disable filtering.
-    #[arg(long)]
-    min_ref_va: Option<u64>,
+    #[arg(long, value_parser = Va::parse)]
+    min_ref_va: Option<Va>,
 
     /// Filter output to xrefs of this kind.
     /// When omitted, all kinds are shown.
@@ -69,31 +69,20 @@ struct Cli {
     limit: usize,
 
     /// Restrict scanning to `from` addresses >= this VA (hex or decimal).
-    /// Segments entirely below this address are skipped — no decode work wasted.
-    #[arg(long, value_parser = parse_va)]
-    start: Option<u64>,
+    #[arg(long, value_parser = Va::parse)]
+    start: Option<Va>,
 
     /// Restrict scanning to `from` addresses < this VA (hex or decimal).
-    #[arg(long, value_parser = parse_va)]
-    end: Option<u64>,
+    #[arg(long, value_parser = Va::parse)]
+    end: Option<Va>,
 
     /// Retain only xrefs whose `to` address >= this VA (hex or decimal).
-    #[arg(long, value_parser = parse_va)]
-    ref_start: Option<u64>,
+    #[arg(long, value_parser = Va::parse)]
+    ref_start: Option<Va>,
 
     /// Retain only xrefs whose `to` address < this VA (hex or decimal).
-    #[arg(long, value_parser = parse_va)]
-    ref_end: Option<u64>,
-}
-
-#[derive(Clone, ValueEnum)]
-enum DepthArg {
-    /// Byte scan of data sections only
-    Scan,
-    /// Linear disasm — immediate targets only
-    Linear,
-    /// ADRP pairing / register prop (recommended)
-    Paired,
+    #[arg(long, value_parser = Va::parse)]
+    ref_end: Option<Va>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -130,15 +119,10 @@ impl KindFilter {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    let depth = match cli.depth {
-        DepthArg::Scan => Depth::ByteScan,
-        DepthArg::Linear => Depth::Linear,
-        DepthArg::Paired => Depth::Paired,
-    };
+    let depth = cli.depth;
 
     eprintln!("loading {}...", cli.binary.display());
-    let binary = LoadedBinary::load_with_base(&cli.binary, cli.base)?;
+    let binary = LoadedBinary::load_with_base(&cli.binary, cli.base.map(Va::raw))?;
     eprintln!(
         "arch={:?}  segments={}  entry_points={}",
         binary.arch,
@@ -146,13 +130,10 @@ fn main() -> Result<()> {
         binary.entry_points.len()
     );
 
-    let min_ref_va = Some(cli
-        .min_ref_va
-        .map(Va::new)
-        .unwrap_or_else(|| binary.min_va()));
+    let min_ref_va = Some(cli.min_ref_va.unwrap_or_else(|| binary.min_va()));
 
-    let from_range = VaRange::from_bounds(cli.start.map(Va::new), cli.end.map(Va::new));
-    let to_range = VaRange::from_bounds(cli.ref_start.map(Va::new), cli.ref_end.map(Va::new));
+    let from_range = VaRange::from_bounds(cli.start, cli.end);
+    let to_range = VaRange::from_bounds(cli.ref_start, cli.ref_end);
 
     let config = PassConfig {
         depth,

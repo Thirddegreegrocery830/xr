@@ -26,6 +26,7 @@ const DEFAULT_BOUNDARY_OVERLAP: u64 = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub enum Depth {
     /// Depth 0: byte scan of data sections only (pointer-sized values).
+    #[value(alias = "scan")]
     ByteScan = 0,
     /// Depth 1: linear disasm, immediate targets + RIP-relative / direct branches.
     Linear = 1,
@@ -206,7 +207,7 @@ impl<'a> XrefPass<'a> {
         // owned_end = next shard's start (or seg_end for the last shard).
         // scan_end includes the overlap lookahead; owned_end does not.
         // Using next shard's start directly handles overlap >= chunk correctly.
-        let code_shards: Vec<(&Segment, Va, Va, Va)> = if depth == Depth::ByteScan {
+        let code_shards: Vec<CodeShard<'_>> = if depth == Depth::ByteScan {
             // ByteScan is data-only — no instruction decoding.
             vec![]
         } else {
@@ -232,14 +233,14 @@ impl<'a> XrefPass<'a> {
                     .enumerate()
                     .map(move |(i, (start, end))| {
                         let owned_end = if i + 1 < n { starts[i + 1] } else { scan_end };
-                        (seg, Va::new(start), Va::new(end), owned_end)
+                        CodeShard { seg, scan_start: Va::new(start), scan_end: Va::new(end), owned_end }
                     })
                     .collect()
             })
             .collect()
         };
 
-        let data_shards: Vec<(&Segment, Va, Va)> = if depth >= Depth::ByteScan {
+        let data_shards: Vec<DataShard<'_>> = if depth >= Depth::ByteScan {
             self.binary
                 .scannable_data_segments()
                 .flat_map(|seg| {
@@ -267,7 +268,7 @@ impl<'a> XrefPass<'a> {
                     );
                     shards
                         .into_iter()
-                        .map(move |(start, end)| (seg, Va::new(start), Va::new(end)))
+                        .map(move |(start, end)| DataShard { seg, scan_start: Va::new(start), scan_end: Va::new(end) })
                         .collect()
                 })
                 .collect()
@@ -350,14 +351,14 @@ impl<'a> XrefPass<'a> {
                         .binary
                         .reloc_pointers
                         .iter()
-                        .filter(|(from, to)| {
-                            min_ref_va.is_none_or(|m| *to >= m)
-                                && from_range.is_none_or(|r| r.contains(*from))
-                                && to_range.is_none_or(|r| r.contains(*to))
+                        .filter(|rp| {
+                            min_ref_va.is_none_or(|m| rp.to >= m)
+                                && from_range.is_none_or(|r| r.contains(rp.from))
+                                && to_range.is_none_or(|r| r.contains(rp.to))
                         })
-                        .map(|&(from, to)| Xref {
-                            from,
-                            to,
+                        .map(|rp| Xref {
+                            from: rp.from,
+                            to: rp.to,
                             kind: crate::xref::XrefKind::DataPointer,
                             confidence: Confidence::ByteScan,
                         })
@@ -372,13 +373,13 @@ impl<'a> XrefPass<'a> {
                 // will be emitted by the next shard instead.
                 code_shards.into_par_iter().for_each_with(
                     tx.clone(),
-                    |tx, (seg, start, end, owned_end)| {
+                    |tx, shard| {
                         if stop_workers.load(Ordering::Relaxed) {
                             return;
                         }
-                        let mut batch = scan_shard(seg, start, end, arch, depth, &ctx);
+                        let mut batch = scan_shard(shard.seg, shard.scan_start, shard.scan_end, arch, depth, &ctx);
                         batch.retain(|x| {
-                            x.from < owned_end
+                            x.from < shard.owned_end
                                 && min_ref_va.is_none_or(|m| x.to >= m)
                                 && to_range.is_none_or(|r| r.contains(x.to))
                         });
@@ -391,11 +392,11 @@ impl<'a> XrefPass<'a> {
                 // Data shards (no overlap, no ownership trimming needed)
                 data_shards
                     .into_par_iter()
-                    .for_each_with(tx, |tx, (seg, start, end)| {
+                    .for_each_with(tx, |tx, shard| {
                         if stop_workers.load(Ordering::Relaxed) {
                             return;
                         }
-                        let region = ScanRegion::new(seg, start, end);
+                        let region = ScanRegion::new(shard.seg, shard.scan_start, shard.scan_end);
                         let mut batch = arch::byte_scan_pointers(&region, ctx.data_idx, ptr_size);
                         batch.retain(|x| {
                             min_ref_va.is_none_or(|m| x.to >= m)
@@ -432,6 +433,26 @@ impl<'a> XrefPass<'a> {
     }
 }
 
+/// A code shard to be scanned by a worker thread.
+///
+/// `scan_end` includes the overlap lookahead; `owned_end` does not.
+/// Xrefs with `from >= owned_end` are in the overlap and will be emitted by
+/// the next shard instead.
+struct CodeShard<'a> {
+    seg: &'a Segment,
+    scan_start: Va,
+    scan_end: Va,
+    /// First address NOT owned by this shard (next shard's start, or seg_end).
+    owned_end: Va,
+}
+
+/// A data shard to be byte-scanned for pointer values.
+struct DataShard<'a> {
+    seg: &'a Segment,
+    scan_start: Va,
+    scan_end: Va,
+}
+
 /// Shared read-only context threaded into every shard scanner.
 /// Bundles the two indices so `scan_shard` stays under the clippy
 /// `too_many_arguments` limit (7).
@@ -439,7 +460,7 @@ struct ScanCtx<'a> {
     seg_idx: &'a SegmentIndex,
     data_idx: &'a SegmentDataIndex<'a>,
     /// Known GOT slot VAs (from `LoadedBinary::got_slots`).
-    got_slots: &'a std::collections::HashSet<Va>,
+    got_slots: &'a rustc_hash::FxHashSet<Va>,
 }
 
 fn scan_shard(

@@ -3,14 +3,34 @@ use anyhow::{anyhow, Result};
 use dylex::DyldContext;
 use goblin::Object;
 use memmap2::Mmap;
+use rustc_hash::FxHashSet;
 use std::any::Any;
-use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 
 /// Default PIE base for ET_DYN ELF binaries whose lowest PT_LOAD has `p_vaddr == 0`.
 /// Matches the traditional Linux x86-64 / AArch64 PIE base and IDA default.
 const DEFAULT_PIE_BASE: u64 = 0x0040_0000;
+
+/// A relocation-derived pointer: a pointer-sized slot at `from` whose value
+/// (after relocation) points to `to`.
+///
+/// These are authoritative — the relocation table says exactly which slots
+/// are pointers and what they point to.  Emitted as `DataPointer` xrefs.
+#[derive(Clone, Copy, Debug)]
+pub struct RelocPointer {
+    /// Address of the pointer slot.
+    pub from: Va,
+    /// Value the pointer resolves to.
+    pub to: Va,
+}
+
+/// A named symbol exported by (or defined in) the binary.
+#[derive(Clone, Debug)]
+pub struct Symbol {
+    pub name: String,
+    pub va: Va,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
@@ -100,7 +120,7 @@ pub struct LoadedBinary {
     /// Entry points / known function seeds.
     pub entry_points: Vec<Va>,
     /// Exports / named symbols with their addresses.
-    pub symbols: Vec<(String, Va)>,
+    pub symbols: Vec<Symbol>,
     /// Non-zero if this is a PIE ELF that was rebased by the loader.
     /// All segment VAs, entry points, and symbols have already had this
     /// value added. 0 for non-PIE binaries and non-ELF formats.
@@ -111,15 +131,15 @@ pub struct LoadedBinary {
     /// `JMP [RIP+disp32]` xref emission to actual import-GOT slots
     /// (vs arbitrary RIP-relative indirect calls through non-GOT pointers).
     /// Populated for ELF binaries; empty for Mach-O and PE.
-    pub got_slots: HashSet<Va>,
-    /// Relocation-derived pointer pairs `(from_va, to_va)`.
+    pub got_slots: FxHashSet<Va>,
+    /// Relocation-derived pointer entries.
     ///
-    /// Each entry represents a pointer-sized slot at `from_va` that the
-    /// relocation table says points to `to_va`.  Emitted as `DataPointer`
-    /// xrefs in the scan pass.  Populated from ELF `.rela.dyn` / `.rel.dyn`
+    /// Each entry represents a pointer-sized slot that the relocation table
+    /// says points to a mapped address.  Emitted as `DataPointer` xrefs in
+    /// the scan pass.  Populated from ELF `.rela.dyn` / `.rel.dyn`
     /// (R_*_RELATIVE, R_*_64, R_*_ABS64) and PE base relocations + IAT.
     /// Empty for formats without relocation tables.
-    pub reloc_pointers: Vec<(Va, Va)>,
+    pub reloc_pointers: Vec<RelocPointer>,
     /// The underlying mmap — kept alive here.
     _mmap: Mmap,
     /// Zero-filled BSS buffers allocated by the loader.
@@ -212,7 +232,7 @@ impl LoadedBinary {
             entry_points: vec![],
             symbols: vec![],
             pie_base: 0,
-            got_slots: HashSet::new(),
+            got_slots: FxHashSet::default(),
             reloc_pointers: Vec::new(),
             _mmap: mmap,
             _bss_bufs: vec![],
@@ -269,13 +289,13 @@ struct ParseResult {
     arch: Arch,
     segments: Vec<Segment>,
     entry_points: Vec<Va>,
-    symbols: Vec<(String, Va)>,
+    symbols: Vec<Symbol>,
     /// Non-zero only for PIE ELF binaries rebased by `parse_elf`.
     pie_base: u64,
     /// GOT slot VAs from GLOB_DAT / JUMP_SLOT relocs. Empty for non-ELF.
-    got_slots: HashSet<Va>,
-    /// Relocation-derived pointer pairs `(from_va, to_va)`.
-    reloc_pointers: Vec<(Va, Va)>,
+    got_slots: FxHashSet<Va>,
+    /// Relocation-derived pointer entries.
+    reloc_pointers: Vec<RelocPointer>,
 }
 
 /// Allocate a zero-filled buffer of `size` bytes, store it in `bufs` for
@@ -324,7 +344,7 @@ fn parse_binary(
                 entry_points: vec![Va::ZERO],
                 symbols: vec![],
                 pie_base: 0,
-                got_slots: HashSet::new(),
+                got_slots: FxHashSet::default(),
                 reloc_pointers: Vec::new(),
             })
         }
@@ -408,7 +428,7 @@ fn parse_dyld_cache(path: &Path) -> Result<DyldParseResult> {
             entry_points: vec![],
             symbols: vec![],
             pie_base: 0,
-            got_slots: HashSet::new(),
+            got_slots: FxHashSet::default(),
             reloc_pointers: Vec::new(),
         },
         dyld_ctx: ctx,
@@ -664,8 +684,8 @@ fn parse_elf(
             if !name.is_empty() {
                 // ARM Thumb symbols have LSB set — strip it for the address.
                 // Apply pie_base after stripping the Thumb LSB.
-                let addr = Va::new((sym.st_value & !1) + pie_base);
-                symbols.push((name.to_string(), addr));
+                let va = Va::new((sym.st_value & !1) + pie_base);
+                symbols.push(Symbol { name: name.to_string(), va });
             }
         }
     }
@@ -694,7 +714,7 @@ fn parse_elf(
 /// These are the GOT entries that the dynamic linker fills with import
 /// addresses.  Used by the x86-64 scanner to distinguish actual GOT-indirect
 /// calls (`CALL [RIP+got_slot]`) from other RIP-relative indirect calls.
-fn build_elf_got_slots(elf: &goblin::elf::Elf, pie_base: u64) -> HashSet<Va> {
+fn build_elf_got_slots(elf: &goblin::elf::Elf, pie_base: u64) -> FxHashSet<Va> {
     const R_X86_64_GLOB_DAT: u32 = 6;
     const R_X86_64_JUMP_SLOT: u32 = 7;
     const R_AARCH64_GLOB_DAT: u32 = 1025;
@@ -761,7 +781,7 @@ fn build_elf_reloc_pointers(
     elf: &goblin::elf::Elf,
     pie_base: u64,
     segments: &[Segment],
-) -> Vec<(Va, Va)> {
+) -> Vec<RelocPointer> {
     use goblin::elf::section_header::SHN_UNDEF;
 
     // Relocation types that encode a full pointer value.
@@ -782,7 +802,7 @@ fn build_elf_reloc_pointers(
             // RELATIVE: target = pie_base + addend (no symbol lookup).
             let target = Va::new((rel.r_addend.unwrap_or(0) as u64).wrapping_add(pie_base));
             if seg_set.contains(target) {
-                result.push((Va::new(from), target));
+                result.push(RelocPointer { from: Va::new(from), to: target });
             }
         } else if r_type == R_X86_64_64 || r_type == R_AARCH64_ABS64 {
             // ABS64: target = sym.st_value + pie_base + addend (defined symbols only).
@@ -796,7 +816,7 @@ fn build_elf_reloc_pointers(
                                 .wrapping_add(rel.r_addend.unwrap_or(0) as u64),
                         );
                         if seg_set.contains(target) {
-                            result.push((Va::new(from), target));
+                            result.push(RelocPointer { from: Va::new(from), to: target });
                         }
                     }
                 }
@@ -895,7 +915,7 @@ fn parse_macho(
     if let Some(syms) = macho.symbols.as_ref() {
         for (name, nlist) in syms.iter().flatten() {
             if !name.is_empty() && nlist.n_value != 0 {
-                symbols.push((name.to_string(), Va::new(nlist.n_value)));
+                symbols.push(Symbol { name: name.to_string(), va: Va::new(nlist.n_value) });
             }
         }
     }
@@ -914,7 +934,7 @@ fn parse_macho(
         entry_points,
         symbols,
         pie_base: 0,
-        got_slots: HashSet::new(),
+        got_slots: FxHashSet::default(),
         reloc_pointers: Vec::new(),
     })
 }
@@ -1041,7 +1061,7 @@ fn parse_pe(
     let mut symbols = Vec::new();
     for export in &pe.exports {
         if let Some(name) = export.name {
-            symbols.push((name.to_string(), Va::new(image_base + export.rva as u64)));
+            symbols.push(Symbol { name: name.to_string(), va: Va::new(image_base + export.rva as u64) });
         }
     }
 
@@ -1053,7 +1073,7 @@ fn parse_pe(
         entry_points,
         symbols,
         pie_base: 0,
-        got_slots: HashSet::new(),
+        got_slots: FxHashSet::default(),
         reloc_pointers,
     })
 }
@@ -1064,42 +1084,47 @@ fn parse_pe(
 /// entry (type 10) identifies a 64-bit pointer slot. We read the pointer value
 /// from the file and emit `(slot_va, pointer_value)` when the pointer falls
 /// within a mapped segment.
+/// A single PE section's RVA→file mapping, used for binary-search reads.
+struct PeSectionEntry {
+    rva: u32,
+    end_rva: u32,
+    raw_offset: usize,
+    raw_size: usize,
+}
+
 /// Sorted RVA→file-offset map for O(log n) reads from PE sections.
 struct PeSectionMap {
-    /// (sec_rva, sec_end_rva, sec_raw_offset, sec_raw_size) sorted by rva.
-    entries: Vec<(u32, u32, usize, usize)>,
+    entries: Vec<PeSectionEntry>,
 }
 
 impl PeSectionMap {
     fn build(pe: &goblin::pe::PE) -> Self {
-        let mut entries: Vec<(u32, u32, usize, usize)> = pe
+        let mut entries: Vec<PeSectionEntry> = pe
             .sections
             .iter()
             .filter(|s| s.size_of_raw_data > 0)
-            .map(|s| {
-                (
-                    s.virtual_address,
-                    s.virtual_address + s.virtual_size,
-                    s.pointer_to_raw_data as usize,
-                    s.size_of_raw_data as usize,
-                )
+            .map(|s| PeSectionEntry {
+                rva: s.virtual_address,
+                end_rva: s.virtual_address + s.virtual_size,
+                raw_offset: s.pointer_to_raw_data as usize,
+                raw_size: s.size_of_raw_data as usize,
             })
             .collect();
-        entries.sort_unstable_by_key(|e| e.0);
+        entries.sort_unstable_by_key(|e| e.rva);
         Self { entries }
     }
 
     /// Resolve an RVA to a file offset, or `None` if out of range.
     fn rva_to_file_offset(&self, rva: u32) -> Option<usize> {
-        let idx = self.entries.partition_point(|e| e.0 <= rva);
+        let idx = self.entries.partition_point(|e| e.rva <= rva);
         if idx == 0 {
             return None;
         }
-        let (sec_rva, sec_end, sec_raw_off, sec_raw_size) = self.entries[idx - 1];
-        if rva >= sec_rva && rva < sec_end {
-            let offset_in_sec = (rva - sec_rva) as usize;
-            if offset_in_sec < sec_raw_size {
-                return Some(sec_raw_off + offset_in_sec);
+        let e = &self.entries[idx - 1];
+        if rva >= e.rva && rva < e.end_rva {
+            let offset_in_sec = (rva - e.rva) as usize;
+            if offset_in_sec < e.raw_size {
+                return Some(e.raw_offset + offset_in_sec);
             }
         }
         None
@@ -1118,7 +1143,7 @@ fn build_pe_reloc_pointers(
     pe: &goblin::pe::PE,
     image_base: u64,
     segments: &[Segment],
-) -> Vec<(Va, Va)> {
+) -> Vec<RelocPointer> {
     let seg_set = VaRangeSet::build(segments);
     let sec_map = PeSectionMap::build(pe);
 
@@ -1169,7 +1194,7 @@ fn build_pe_reloc_pointers(
                         let slot_va = image_base + slot_rva as u64;
                         if let Some(ptr_val) = sec_map.read_u64_at_rva(bytes, slot_rva) {
                             if ptr_val != 0 && seg_set.contains(Va::new(ptr_val)) {
-                                result.push((Va::new(slot_va), Va::new(ptr_val)));
+                                result.push(RelocPointer { from: Va::new(slot_va), to: Va::new(ptr_val) });
                             }
                         }
                     }

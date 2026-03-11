@@ -22,10 +22,10 @@
 //! The comparison uses a KIND-AGNOSTIC (from, to) match as the primary
 //! signal, and also reports a strict (from, to, kind) match for reference.
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -165,7 +165,7 @@ impl Stats {
     }
 }
 
-fn compute_stats(xr: &HashSet<AddrPair>, ida: &HashSet<AddrPair>) -> Stats {
+fn compute_stats(xr: &AHashSet<AddrPair>, ida: &AHashSet<AddrPair>) -> Stats {
     let tp = xr.intersection(ida).count();
     Stats {
         tp,
@@ -322,10 +322,10 @@ fn main() -> Result<()> {
     let ext_bound = extern_bound(&binary);
     let mut extern_normalized = 0u64;
 
-    let mut ida_by_kind: HashMap<XrefKind, HashSet<AddrPair>> = HashMap::new();
-    let mut ida_all: HashSet<AddrPair> = HashSet::new();
+    let mut ida_by_kind: AHashMap<XrefKind, AHashSet<AddrPair>> = AHashMap::new();
+    let mut ida_all: AHashSet<AddrPair> = AHashSet::new();
     for &k in XrefKind::SCORED_KINDS {
-        ida_by_kind.insert(k, HashSet::new());
+        ida_by_kind.insert(k, AHashSet::new());
     }
 
     for x in ida_raw {
@@ -408,11 +408,11 @@ fn main() -> Result<()> {
         let (xrefs, ms) = run_pass(&binary, depth, cli.workers, cli.runs, min_ref_va);
 
         // Build xr sets per kind and overall
-        let mut xr_by_kind: HashMap<XrefKind, HashSet<AddrPair>> = HashMap::new();
+        let mut xr_by_kind: AHashMap<XrefKind, AHashSet<AddrPair>> = AHashMap::new();
         for &k in XrefKind::SCORED_KINDS {
-            xr_by_kind.insert(k, HashSet::new());
+            xr_by_kind.insert(k, AHashSet::new());
         }
-        let mut xr_all: HashSet<AddrPair> = HashSet::new();
+        let mut xr_all: AHashSet<AddrPair> = AHashSet::new();
 
         for x in &xrefs {
             let pair = (x.from, x.to);
@@ -462,12 +462,12 @@ fn main() -> Result<()> {
         // Dump FP/FN/TP sets if requested (Paired depth only)
         if depth == Depth::Paired {
             // Helper: build full xref vec filtered by kind for a given pair set
-            let xref_map: std::collections::HashMap<AddrPair, &Xref> =
+            let xref_map: AHashMap<AddrPair, &Xref> =
                 xrefs.iter().map(|x| ((x.from, x.to), x)).collect();
 
             let kind_filter = cli.dump_kind.as_deref().and_then(XrefKind::from_name);
 
-            let matches_kind = |pair: &AddrPair, set: &HashSet<AddrPair>| -> bool {
+            let matches_kind = |pair: &AddrPair, set: &AHashSet<AddrPair>| -> bool {
                 if let Some(k) = kind_filter {
                     // Check if xr has this pair with the right kind
                     if let Some(x) = xref_map.get(pair) {

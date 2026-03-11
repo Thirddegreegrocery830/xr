@@ -24,6 +24,19 @@ use crate::xref::{Confidence, Xref, XrefKind};
 // Larger window catches more but also more false positives from dead registers.
 const ADRP_WINDOW: usize = 8;
 
+/// How this register value was resolved — determines what xref kinds it can
+/// produce downstream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegSource {
+    /// Set directly by ADRP/ADR/ADD — the value is a code or data address
+    /// that may be called or jumped to.
+    Direct,
+    /// Set by a LDR pointer-follow (chained resolution).  The value is a
+    /// data pointer loaded from memory — NOT callable/jumpable.  BLR/BR
+    /// must not resolve through a chain.
+    Chain,
+}
+
 /// State tracked per register during the ADRP sliding-window scan.
 ///
 /// Populated when an ADRP/ADR/ADD/LDR sets a register to a known address,
@@ -37,10 +50,8 @@ struct AdrpRegState {
     origin_va: Va,
     /// The resolved page address (ADRP) or full address (ADR/ADD/LDR chain).
     value: Va,
-    /// True if this came from a LDR pointer-follow (chained resolution).
-    /// Chained values are data pointers, NOT callable/jumpable addresses —
-    /// BLR/BR must not resolve through a chain.
-    is_chain: bool,
+    /// How this value was resolved — controls what downstream xrefs are valid.
+    source: RegSource,
 }
 
 /// Depth 1: linear scan, immediate targets only.
@@ -63,7 +74,9 @@ pub(crate) fn scan_linear(
     for i in 0..n {
         let offset = i * 4;
         let va = base + offset as u64;
-        let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        let word = u32::from_le_bytes(
+            data[offset..offset + 4].try_into().expect("4-byte aligned word"),
+        );
         let insn = Arm64Insn::decode(word);
         if let Some(xref) = immediate_xref(insn, va, idx) {
             xrefs.push(xref);
@@ -94,7 +107,9 @@ pub(crate) fn scan_adrp(
     for i in 0..n {
         let offset = i * 4;
         let va = base + offset as u64;
-        let word = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        let word = u32::from_le_bytes(
+            data[offset..offset + 4].try_into().expect("4-byte aligned word"),
+        );
 
         // Fast-path: most instructions are not in the tracked set (BL/B/ADRP/ADD/LDR/STR/…).
         // For those we only need to invalidate their destination register — skip full decode.
@@ -123,7 +138,7 @@ pub(crate) fn scan_adrp(
                         insn_index: i,
                         origin_va: Va::new(va),
                         value: Va::new(page),
-                        is_chain: false,
+                        source: RegSource::Direct,
                     });
                 }
             }
@@ -140,7 +155,7 @@ pub(crate) fn scan_adrp(
                         insn_index: i,
                         origin_va: Va::new(va),
                         value: Va::new(target),
-                        is_chain: false,
+                        source: RegSource::Direct,
                     });
                 }
             }
@@ -167,7 +182,7 @@ pub(crate) fn scan_adrp(
                                     insn_index: i,
                                     origin_va: st.origin_va,
                                     value: target,
-                                    is_chain: false,
+                                    source: RegSource::Direct,
                                 });
                             }
                             if rd != rn {
@@ -235,7 +250,7 @@ pub(crate) fn scan_adrp(
                                     insn_index: i,
                                     origin_va: Va::new(va),
                                     value: Va::new(v),
-                                    is_chain: true,
+                                    source: RegSource::Chain,
                                 });
                             }
                         }
@@ -251,7 +266,7 @@ pub(crate) fn scan_adrp(
                         if i - st.insn_index <= ADRP_WINDOW {
                             let addr = st.value + insn.ldr_str_offset();
                             let is_writable_data = idx.flags_at(addr).is_some_and(|f| {
-                                f & super::FLAG_WRITE != 0 && f & super::FLAG_EXEC == 0
+                                f.contains(super::SegFlags::WRITE) && !f.contains(super::SegFlags::EXEC)
                             });
                             if is_writable_data {
                                 xrefs.push(Xref {
@@ -271,7 +286,7 @@ pub(crate) fn scan_adrp(
                 let rn = insn.rn() as usize;
                 if rn < 31 {
                     if let Some(st) = adrp_state[rn] {
-                        if !st.is_chain && i - st.insn_index <= ADRP_WINDOW && idx.is_exec(st.value) {
+                        if st.source == RegSource::Direct && i - st.insn_index <= ADRP_WINDOW && idx.is_exec(st.value) {
                             xrefs.push(Xref {
                                 from: Va::new(va),
                                 to: st.value,
@@ -288,7 +303,7 @@ pub(crate) fn scan_adrp(
                 let rn = insn.rn() as usize;
                 if rn < 31 {
                     if let Some(st) = adrp_state[rn] {
-                        if !st.is_chain && i - st.insn_index <= ADRP_WINDOW && idx.is_exec(st.value) {
+                        if st.source == RegSource::Direct && i - st.insn_index <= ADRP_WINDOW && idx.is_exec(st.value) {
                             xrefs.push(Xref {
                                 from: Va::new(va),
                                 to: st.value,

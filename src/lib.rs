@@ -7,7 +7,7 @@ pub(crate) mod shard;
 pub mod va;
 pub mod xref;
 
-pub use loader::{Arch, DecodeMode, LoadedBinary, Segment};
+pub use loader::{Arch, DecodeMode, LoadedBinary, RelocPointer, Segment, Symbol};
 pub use pass::{Depth, PassConfig, PassResult, XrefPass};
 pub use va::{Va, VaRange};
 pub use xref::{Confidence, Xref, XrefKind};

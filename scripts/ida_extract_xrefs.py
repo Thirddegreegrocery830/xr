@@ -92,7 +92,7 @@ def main() -> None:
         sys.exit(f'error: {binary} not found')
 
     idb = binary.with_suffix('.i64')
-    out = Path(args.out) if args.out else binary.with_suffix('.xrefs.json')
+    out = Path(args.out) if args.out else Path(str(binary) + '.xrefs.json')
 
     print(f'binary : {binary}')
     print(f'idb    : {idb}')

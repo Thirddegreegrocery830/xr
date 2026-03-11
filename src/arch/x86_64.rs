@@ -17,7 +17,7 @@ use iced_x86::{
     Code, Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, OpAccess,
     OpKind, Register,
 };
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 /// Tracks a register participating in a jump table dispatch.
 ///
@@ -64,7 +64,7 @@ enum PropMode {
 pub(crate) fn scan_linear(
     region: &ScanRegion,
     idx: &SegmentIndex,
-    got_slots: &HashSet<Va>,
+    got_slots: &FxHashSet<Va>,
     data_idx: &SegmentDataIndex,
 ) -> XrefSet {
     scan_core(region, idx, got_slots, data_idx, PropMode::Off)
@@ -75,7 +75,7 @@ pub(crate) fn scan_linear(
 pub(crate) fn scan_with_prop(
     region: &ScanRegion,
     idx: &SegmentIndex,
-    got_slots: &HashSet<Va>,
+    got_slots: &FxHashSet<Va>,
     data_idx: &SegmentDataIndex,
 ) -> XrefSet {
     scan_core(region, idx, got_slots, data_idx, PropMode::On)
@@ -85,7 +85,7 @@ pub(crate) fn scan_with_prop(
 fn scan_core(
     region: &ScanRegion,
     idx: &SegmentIndex,
-    got_slots: &HashSet<Va>,
+    got_slots: &FxHashSet<Va>,
     data_idx: &SegmentDataIndex,
     prop: PropMode,
 ) -> XrefSet {
@@ -199,7 +199,7 @@ fn emit_direct_branches(
     insn: &Instruction,
     va: u64,
     idx: &SegmentIndex,
-    got_slots: &HashSet<Va>,
+    got_slots: &FxHashSet<Va>,
     xrefs: &mut Vec<Xref>,
 ) {
     match insn.flow_control() {
@@ -256,7 +256,7 @@ fn emit_direct_branches(
 fn emit_got_indirect(
     insn: &Instruction,
     va: u64,
-    got_slots: &HashSet<Va>,
+    got_slots: &FxHashSet<Va>,
     xrefs: &mut Vec<Xref>,
 ) {
     // Only applies when the single memory operand uses RIP-relative addressing.
@@ -718,7 +718,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let data_idx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
+        let xrefs = scan_linear(&region_for(&code), &idx, &FxHashSet::default(), &data_idx);
         assert_eq!(xrefs.len(), 1);
         assert_eq!(xrefs[0].from, Va::new(0x1000));
         assert_eq!(xrefs[0].to, Va::new(0x2000));
@@ -742,7 +742,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let data_idx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
+        let xrefs = scan_linear(&region_for(&code), &idx, &FxHashSet::default(), &data_idx);
         let jmp = xrefs.iter().find(|x| x.kind == XrefKind::Jump).unwrap();
         assert_eq!(jmp.from, Va::new(0x1005));
         assert_eq!(jmp.to, Va::new(0x2000));
@@ -765,7 +765,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let data_idx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
+        let xrefs = scan_linear(&region_for(&code), &idx, &FxHashSet::default(), &data_idx);
         let je = xrefs.iter().find(|x| x.kind == XrefKind::CondJump).unwrap();
         assert_eq!(je.from, Va::new(0x100a));
         assert_eq!(je.to, Va::new(0x2000));
@@ -785,7 +785,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let data_idx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
+        let xrefs = scan_linear(&region_for(&code), &idx, &FxHashSet::default(), &data_idx);
         // LEA = takes address → DataPointer (IDA dr_O), not DataRead
         let lea = xrefs
             .iter()
@@ -813,7 +813,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let data_idx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_with_prop(&region_for(&code), &idx, &HashSet::new(), &data_idx);
+        let xrefs = scan_with_prop(&region_for(&code), &idx, &FxHashSet::default(), &data_idx);
         let prop = xrefs
             .iter()
             .find(|x| x.confidence == Confidence::LocalProp)
@@ -833,7 +833,7 @@ mod tests {
         let segs = vec![fake_seg(0x1000, &CODE)];
         let idx = SegmentIndex::build(&segs);
         let data_idx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_linear(&region_for(&code), &idx, &HashSet::new(), &data_idx);
+        let xrefs = scan_linear(&region_for(&code), &idx, &FxHashSet::default(), &data_idx);
         assert!(xrefs.is_empty());
     }
 
@@ -881,7 +881,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let data_idx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_with_prop(&region_for(&code_seg), &idx, &HashSet::new(), &data_idx);
+        let xrefs = scan_with_prop(&region_for(&code_seg), &idx, &FxHashSet::default(), &data_idx);
 
         // Should have Jump xrefs from 0x1013 to 0x2000 and 0x2004
         let jumps: Vec<&Xref> = xrefs
@@ -924,7 +924,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let data_idx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_with_prop(&region_for(&code_seg), &idx, &HashSet::new(), &data_idx);
+        let xrefs = scan_with_prop(&region_for(&code_seg), &idx, &FxHashSet::default(), &data_idx);
 
         let jumps: Vec<&Xref> = xrefs
             .iter()
@@ -958,7 +958,7 @@ mod tests {
 
         let idx = SegmentIndex::build(&segs);
         let data_idx = SegmentDataIndex::build(&segs);
-        let xrefs = scan_with_prop(&region_for(&code_seg), &idx, &HashSet::new(), &data_idx);
+        let xrefs = scan_with_prop(&region_for(&code_seg), &idx, &FxHashSet::default(), &data_idx);
 
         let jumps: Vec<&Xref> = xrefs
             .iter()
