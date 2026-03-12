@@ -40,7 +40,7 @@ Tested against IDA Pro ground truth on 26 binaries across ELF, Mach-O, and PE
 complexity. Call xref precision is near-perfect (F1 ≥0.995) on all tested
 binaries.
 
-See [STATUS.md](STATUS.md) for architecture details and known gaps.
+See [docs/STATUS.md](docs/STATUS.md) for architecture details and known gaps.
 
 ## Supported Formats
 
