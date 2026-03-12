@@ -44,11 +44,13 @@ See [docs/STATUS.md](docs/STATUS.md) for architecture details and known gaps.
 
 ## Supported Formats
 
-- ELF (x86-64, AArch64, x86, ARM32) — including PIE (ET_DYN)
-- Single-arch Mach-O (x86-64, AArch64) — fat binaries require `lipo -extract` first
-- PE / COFF (x86-64, x86, AArch64, ARM32)
+- ELF (x86-64, AArch64) — including PIE (ET_DYN)
+- Single-arch Mach-O (x86-64, ARM64) — fat binaries require `lipo -extract` first
+- PE / COFF (x86-64, ARM64)
 - Apple dyld shared cache
 - Raw flat binary (treated as single executable segment)
+
+x86-32 and ARM32 binaries are loaded but not scanned (architecture stubs only).
 
 ## Options
 
