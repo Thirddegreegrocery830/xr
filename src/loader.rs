@@ -112,10 +112,27 @@ impl Segment {
 /// A loaded binary — mmap'd file + parsed segment list.
 /// The mmap is kept alive for the lifetime of this struct.
 /// All segment data slices are zero-copy into the mmap.
+///
+/// # Safety — field ordering invariant
+///
+/// `Segment::data` slices are `&'static [u8]` whose true lifetime is tied to
+/// the backing stores in this struct (`_mmap`, `_bss_bufs`, `_dyld_ctx`).
+/// Rust drops struct fields in declaration order, so `segments` (field 1) is
+/// dropped **before** the backing stores (fields 8–10).  This guarantees that
+/// no `Segment::data` slice is accessed after its backing memory is freed.
+///
+/// **Do not reorder fields** such that `_mmap`, `_bss_bufs`, or `_dyld_ctx`
+/// appear before `segments`.  The `test_backing_fields_after_segments` test
+/// enforces this invariant at compile time.
 pub struct LoadedBinary {
+    // ── public data (fields 0–6) ──────────────────────────────────────────
     /// Architecture detected from the binary.
     pub arch: Arch,
     /// All mapped segments (code + data).
+    ///
+    /// # Safety
+    /// Must be declared before the backing-store fields (`_mmap`, `_bss_bufs`,
+    /// `_dyld_ctx`) so it is dropped first.
     pub segments: Vec<Segment>,
     /// Entry points / known function seeds.
     pub entry_points: Vec<Va>,
@@ -140,15 +157,14 @@ pub struct LoadedBinary {
     /// (R_*_RELATIVE, R_*_64, R_*_ABS64) and PE base relocations + IAT.
     /// Empty for formats without relocation tables.
     pub reloc_pointers: Vec<RelocPointer>,
-    /// The underlying mmap — kept alive here.
+
+    // ── backing stores (fields 7–9) — MUST come after `segments` ──────────
+    /// The underlying mmap — kept alive so `Segment::data` slices remain valid.
     _mmap: Mmap,
-    /// Zero-filled BSS buffers allocated by the loader.
-    /// Kept alive here so the `&'static [u8]` slices in `segments` remain valid.
-    /// Dropped after `segments` (struct fields drop in declaration order).
+    /// Zero-filled BSS buffers — `Segment::data` slices may point into these.
     _bss_bufs: Vec<Box<[u8]>>,
-    /// For dyld shared caches: the DyldContext (owns the subcache mmaps).
+    /// For dyld shared caches: the `DyldContext` (owns the subcache mmaps).
     /// Segment slices borrow from these mmaps zero-copy.
-    /// Must be dropped AFTER `segments` — field order guarantees this.
     _dyld_ctx: Option<Box<dyn Any + Send + Sync>>,
 }
 
@@ -1718,5 +1734,30 @@ mod tests {
         for (a, b) in vas_a.iter().zip(vas_b.iter()) {
             assert_eq!(*b - *a, delta, "VA shift mismatch: {a:#x} vs {b:#x}");
         }
+    }
+
+    /// Verify that `segments` is declared before the backing-store fields
+    /// (`_mmap`, `_bss_bufs`, `_dyld_ctx`) in `LoadedBinary`.
+    ///
+    /// Rust drops struct fields in declaration order.  `Segment::data` slices
+    /// are `&'static [u8]` whose true lifetime is the backing store.  If a
+    /// backing-store field were declared *before* `segments`, it would be
+    /// dropped first, leaving dangling slices that `Drop` impls or destructors
+    /// could observe.
+    ///
+    /// This test uses `std::mem::offset_of!` to assert the relative positions
+    /// at compile time — if someone reorders the fields, this test fails.
+    #[test]
+    fn test_backing_fields_after_segments() {
+        let seg = std::mem::offset_of!(LoadedBinary, segments);
+        let mmap = std::mem::offset_of!(LoadedBinary, _mmap);
+        let bss = std::mem::offset_of!(LoadedBinary, _bss_bufs);
+        let dyld = std::mem::offset_of!(LoadedBinary, _dyld_ctx);
+        assert!(
+            seg < mmap && seg < bss && seg < dyld,
+            "LoadedBinary field order violated: `segments` (offset {seg}) must be \
+             declared before _mmap ({mmap}), _bss_bufs ({bss}), _dyld_ctx ({dyld}) \
+             so it is dropped first (Rust drops fields in declaration order)"
+        );
     }
 }

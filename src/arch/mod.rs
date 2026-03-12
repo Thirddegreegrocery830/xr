@@ -30,6 +30,12 @@ pub(crate) struct ScanRegion<'a> {
 
 impl<'a> ScanRegion<'a> {
     pub fn new(seg: &'a Segment, start_va: Va, end_va: Va) -> Self {
+        debug_assert!(
+            start_va >= seg.va && end_va >= start_va,
+            "ScanRegion::new: start_va ({start_va:#x}) must be >= seg.va ({:#x}) \
+             and end_va ({end_va:#x}) must be >= start_va",
+            seg.va,
+        );
         let offset = (start_va - seg.va) as usize;
         let len = ((end_va - start_va) as usize).min(seg.data.len() - offset);
         Self {

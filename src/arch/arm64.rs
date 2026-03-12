@@ -126,13 +126,20 @@ impl CmpBound {
     }
 }
 
+/// Per-register CMP state: the bound and when it was set.
+#[derive(Clone, Copy)]
+struct CmpRegState {
+    insn_index: usize,
+    bound: CmpBound,
+}
+
 /// Bundles the two per-register state arrays that `scan_adrp` maintains.
 ///
 /// All accesses go through [`Reg`], so the `< 31` bound is enforced once at
 /// construction rather than at every use site.
 struct ScanState {
     adrp: [Option<AdrpRegState>; 32],
-    cmp:  [Option<CmpBound>; 32],
+    cmp:  [Option<CmpRegState>; 32],
 }
 
 impl ScanState {
@@ -162,12 +169,20 @@ impl ScanState {
         self.adrp[r.idx()] = None;
     }
     #[inline]
-    fn set_cmp(&mut self, r: Reg, bound: CmpBound) {
-        self.cmp[r.idx()] = Some(bound);
+    fn set_cmp(&mut self, r: Reg, insn_index: usize, bound: CmpBound) {
+        self.cmp[r.idx()] = Some(CmpRegState { insn_index, bound });
     }
+    /// Retrieve the CMP bound for `r`, but only if the CMP was within
+    /// `window` instructions of `current_index`.
     #[inline]
-    fn get_cmp(&self, r: Reg) -> Option<CmpBound> {
-        self.cmp[r.idx()]
+    fn get_cmp(&self, r: Reg, current_index: usize, window: usize) -> Option<CmpBound> {
+        self.cmp[r.idx()].and_then(|st| {
+            if current_index - st.insn_index <= window {
+                Some(st.bound)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -249,7 +264,7 @@ pub(crate) fn scan_adrp(
                 let shift = (word >> 22) & 1;
                 if let Some(rn) = Reg::new(rn_raw) {
                     if shift == 0 {
-                        state.set_cmp(rn, CmpBound(imm12 + 1));
+                        state.set_cmp(rn, i, CmpBound(imm12 + 1));
                     }
                 }
             }
@@ -511,6 +526,9 @@ struct JumpTableAddInfo {
     /// Determined by `option[2]` (bit 15) of an ADD (extended register):
     /// set for SXTB/SXTH/SXTW/SXTX, clear for UXTB/UXTH/UXTW/UXTX.
     sign_extend: bool,
+    /// Rn of the ADD — the register holding the ADR/target-base value.
+    /// Used to verify the ADR's Rd matches.
+    base_reg: Reg,
 }
 
 impl JumpTableAddInfo {
@@ -522,9 +540,11 @@ impl JumpTableAddInfo {
         // bit[21]=0 distinguishes from extended register form.
         if word & 0xFF20_0000 == 0x8B00_0000 {
             let shift = (word >> 10) & 0x3F;
+            let base_reg = Reg::new(((word >> 5) & 0x1F) as u8)?;
             return (shift <= MAX_JUMP_TABLE_SHIFT).then_some(Self {
                 shift,
                 sign_extend: false,
+                base_reg,
             });
         }
         // ADD (extended register): 1000_1011_001x_xxxx_xxxx_xxxx_xxxx_xxxx
@@ -533,9 +553,11 @@ impl JumpTableAddInfo {
         if word & 0xFFE0_0000 == 0x8B20_0000 {
             let shift = (word >> 10) & 7;
             let sign_extend = word & (1 << 15) != 0;
+            let base_reg = Reg::new(((word >> 5) & 0x1F) as u8)?;
             return (shift <= MAX_JUMP_TABLE_SHIFT).then_some(Self {
                 shift,
                 sign_extend,
+                base_reg,
             });
         }
         // Not a recognised ADD form (shifted or extended register).
@@ -623,7 +645,10 @@ fn recover_arm64_jump_table(
 
     // Table size from CMP bound.  Prefer the backward-scan CMP (survives
     // register overwrites between CMP and BR) over forward-scan state.
-    let Some(bound) = pattern.cmp_bound.or_else(|| ctx.state.get_cmp(pattern.index_reg)) else {
+    // The forward-scan fallback applies the same window check as ADRP state
+    // to avoid picking up a stale CMP from hundreds of instructions ago.
+    let fwd_cmp = ctx.state.get_cmp(pattern.index_reg, br_index, JUMP_TABLE_LOOKBACK);
+    let Some(bound) = pattern.cmp_bound.or(fwd_cmp) else {
         return;
     };
     let limit = bound.table_limit();
@@ -700,19 +725,22 @@ fn scan_backward_for_pattern(
             add_info = JumpTableAddInfo::decode(w);
         }
 
-        // ADR Xd, label — target base for the jump table
+        // ADR Xd, label — target base for the jump table.
+        // Only accept if Rd matches the ADD's base register (Rn), i.e. the
+        // ADR result actually feeds the ADD that computes the jump target.
+        // This prevents unrelated ADR instructions in cascaded switches or
+        // multi-ADR functions from being misidentified as the target base.
         if (w & 0x9F00_0000) == 0x1000_0000 {
-            let immlo = (w >> 29) & 3;
-            let immhi = (w >> 5) & 0x7_FFFF;
-            let mut imm = ((immhi << 2) | immlo) as i64;
-            if imm & (1 << 20) != 0 {
-                imm -= 1 << 21;
-            }
-            let adr_target = (insn_va.raw() as i64 + imm) as u64;
-            // Accept the first (closest to BR) ADR as target_base.
-            // TODO: verify that ADR Rd feeds the BR target register chain
-            // to reduce false positives from unrelated ADR instructions.
-            if target_base.is_none() {
+            let adr_rd = Reg::new((w & 0x1F) as u8);
+            let feeds_add = add_info.is_some_and(|ai| adr_rd == Some(ai.base_reg));
+            if target_base.is_none() && feeds_add {
+                let immlo = (w >> 29) & 3;
+                let immhi = (w >> 5) & 0x7_FFFF;
+                let mut imm = ((immhi << 2) | immlo) as i64;
+                if imm & (1 << 20) != 0 {
+                    imm -= 1 << 21;
+                }
+                let adr_target = (insn_va.raw() as i64 + imm) as u64;
                 target_base = Some(Va::new(adr_target));
             }
         }
@@ -800,15 +828,12 @@ fn scan_backward_for_pattern(
     let idx_reg = index_reg?;
     let local_cmp = cmp_bound.and_then(|(r, b)| if r == idx_reg { Some(b) } else { None });
 
-    // Default to no shift / no sign-extend if no ADD was found.
-    let add = add_info.unwrap_or(JumpTableAddInfo { shift: 0, sign_extend: false });
-
     Some(JumpTablePattern {
         target_base: target_base?,
         table_base: table_base?,
         entry_size: entry_size?,
         index_reg: idx_reg,
-        add_info: add,
+        add_info: add_info?,
         cmp_bound: local_cmp,
     })
 }
@@ -843,7 +868,7 @@ fn resolve_table_base(
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Extract an immediate xref from instructions with direct targets.
-#[inline(always)]
+#[inline]
 fn immediate_xref(insn: Arm64Insn, va: Va, idx: &SegmentIndex) -> Option<Xref> {
     match insn {
         Arm64Insn::Bl(_) => {
