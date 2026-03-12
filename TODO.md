@@ -10,32 +10,28 @@
 
 ## Architecture & Design
 
-- [x] ARM64 `scan_linear` takes unused `_data_idx: &SegmentDataIndex`
-  parameter. The x86-64 side was already cleaned up (removed the unused
-  `_data_idx` from `scan_linear`/`scan_with_prop`) but ARM64's
-  `scan_linear` still carries it. `scan_adrp` legitimately uses it for
-  pointer-follow, but `scan_linear` does not.
-  (`src/arch/arm64.rs:33`)
+- [ ] No GOT/IAT map for Mach-O binaries. `parse_macho` returns empty
+  `got_slots`, so indirect `BLR Xn` / `CALL [RIP+got]` xrefs to extern
+  symbols are never resolved for Mach-O. Needs `__got`/`__la_symbol_ptr`
+  parsing.
+  (`src/loader/macho.rs`)
 
-- [ ] No GOT/IAT map for Mach-O or PE binaries. `parse_macho` and
-  `parse_pe` return empty `got_map`, so indirect `CALL [RIP+got]` /
-  `JMP [RIP+got]` xrefs to extern symbols are never resolved for those
-  formats. ELF's `build_elf_got_map` shows the approach; Mach-O needs
-  `__got`/`__la_symbol_ptr` parsing, PE needs IAT parsing.
-  (`src/loader.rs`)
-
-- [ ] `build_elf_got_map` only handles x86-64 and AArch64 relocation
+- [ ] `build_elf_got_slots` only handles x86-64 and AArch64 relocation
   types (`R_X86_64_GLOB_DAT/JUMP_SLOT`, `R_AARCH64_GLOB_DAT/JUMP_SLOT`).
   ARM32 (`R_ARM_GLOB_DAT`=21, `R_ARM_JUMP_SLOT`=22) and x86
   (`R_386_GLOB_DAT`=6, `R_386_JMP_SLOT`=7) are missing — GOT-indirect
   calls on those arches produce no extern-VA xrefs.
-  (`src/loader.rs`, `build_elf_got_map`)
+  (`src/loader/elf.rs`)
 
 - [ ] `ScanRegion` has two `#[allow(dead_code)]` fields: `mode` and
   `writable`. They are reserved for future ARM32/Thumb and
   write-tracking passes. Either implement the passes that use them or
   remove the fields and add them back when needed.
   (`src/arch/mod.rs`)
+
+- [ ] Split `loader.rs` into per-format modules — ✅ DONE (now
+  `src/loader/{mod,elf,macho,pe,dyld}.rs`). Consider further splitting
+  `src/arch/arm64.rs` (~1253 lines) if it grows further.
 
 ## Performance
 
@@ -61,6 +57,10 @@
   (`src/pass.rs`, `src/arch/arm64.rs`, `src/arch/x86_64.rs`)
 
 ## Minor
+
+- [ ] `benchmark.rs` uses `ahash` while the main crate uses `rustc_hash`.
+  Inconsistent but harmless. Consider standardising on one.
+  (`src/bin/benchmark.rs`)
 
 - [ ] `benchmark.rs` `run_pass` discards the `PassResult` returned by
   `XrefPass::run` (assigned to `_result`). The `elapsed_ms` and

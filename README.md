@@ -23,8 +23,6 @@ cargo build --release
 # Show disasm context around each xref site (like grep -A/-B)
 ./target/release/xr /path/to/binary --depth paired -A 3 -B 2
 
-# Evaluate against IDA ground truth
-python3 scripts/eval.py /path/to/binary --depth 2
 ```
 
 ## Analysis Depths
@@ -35,18 +33,14 @@ python3 scripts/eval.py /path/to/binary --depth 2
 | `--depth linear` | Linear | Linear disasm — immediate targets + RIP-relative |
 | `--depth paired` | Paired | ADRP+ADD/LDR pairs (ARM64) or register prop (x86-64) — **recommended** |
 
-## Current F1 Scores (paired depth)
+## Accuracy
 
-| Binary | Overall F1 |
-|--------|------------|
-| curl (ARM64 ELF) | 0.944 |
-| curl (x86-64 ELF) | 0.961 |
-| libharlem-shake.so (x86-64 PIE ELF) | 0.862 |
-| libziggy.so (AArch64 PIE ELF) | 0.818 |
-| hello (Mach-O AArch64) | 0.950 |
-| hello (PE x86-64) | 0.847 |
+Tested against IDA Pro ground truth on 26 binaries across ELF, Mach-O, and PE
+(x86-64 and ARM64). Overall F1 ranges from **0.84–0.99** depending on binary
+complexity. Call xref precision is near-perfect (F1 ≥0.995) on all tested
+binaries.
 
-Call xref precision is near-perfect (F1 ~1.000) on all tested binaries.
+See [STATUS.md](STATUS.md) for architecture details and known gaps.
 
 ## Supported Formats
 
@@ -78,25 +72,17 @@ OPTIONS:
     -B, --before-context <N>    Show N instructions before each xref site
 ```
 
-## Architecture
-
-See [STATUS.md](STATUS.md) for a detailed description of the architecture, design
-decisions, empirical benchmark history, and known gaps.
-
-## Benchmarking Against IDA Ground Truth
+## Benchmarking
 
 ```sh
 # Build the benchmark binary
 cargo build --release --bin benchmark
 
-# Run against a testcase (requires <binary>.xrefs.json ground-truth file)
+# Run against a ground-truth file (JSON exported from IDA)
 ./target/release/benchmark \
-    --binary testcases/curl-amd64 \
-    --ground-truth testcases/curl-amd64.xrefs.json \
+    --binary /path/to/binary \
+    --ground-truth /path/to/binary.xrefs.json \
     --depth paired
-
-# Quick eval via Python (no rebuild needed)
-python3 scripts/eval.py testcases/curl-aarch64 --depth 2
 ```
 
 Ground-truth JSON files are generated with `scripts/ida_extract_xrefs_binary.py`
